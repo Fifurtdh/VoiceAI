@@ -1,0 +1,10 @@
+{
+  "name": "Remix Voice Khata",
+  "description": "Voice-powered credit ledger (udhaar khata) for Indian kirana shopkeepers with offline-first local storage and multilingual support.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
