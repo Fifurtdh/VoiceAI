@@ -25,6 +25,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [bgLoaded, setBgLoaded] = useState(true);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -56,25 +57,47 @@ export const LoginPage: React.FC<LoginPageProps> = ({
   };
 
   return (
-    <div className="min-h-screen bg-[#FAF8F3] text-[#121714] flex flex-col justify-center px-4 py-8 sm:px-6 lg:px-8">
-      <div className="w-full max-w-5xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8 items-center">
-        {/* Desktop friendly intro column (compact & welcoming on mobile) */}
-        <div className="lg:col-span-5 text-center lg:text-left space-y-4">
-          <div className="flex justify-center lg:justify-start">
-            <AuthLogo />
-          </div>
-          <h1 className="text-3xl sm:text-4xl font-extrabold tracking-tight text-[#121714] pt-2">
-            Welcome Back!
-          </h1>
-          <p className="text-base sm:text-lg text-[#3C4740] max-w-md mx-auto lg:mx-0">
-            Sign in with your store mobile number to manage your udhaar khata,
-            voice entries, and customer balances safely.
-          </p>
-        </div>
+    <div className="relative min-h-screen overflow-hidden bg-[#1A1611] text-[#121714] flex flex-col justify-center px-4 py-8 sm:px-6 lg:px-8">
+      {/* Full-bleed Kirana Store Background with Subtle Drift Motion */}
+      <div
+        className="pointer-events-none fixed inset-0 overflow-hidden select-none"
+        aria-hidden="true"
+      >
+        {bgLoaded ? (
+          <img
+            src="/assets/aistudio/image_f1766328.jpg_d3c0ed48.jpeg"
+            alt=""
+            referrerPolicy="no-referrer"
+            onError={() => setBgLoaded(false)}
+            data-testid="login-bg-image"
+            className="h-full w-full object-cover object-[68%_32%] lg:object-[62%_35%] animate-login-bg-drift"
+          />
+        ) : (
+          <div className="h-full w-full bg-gradient-to-br from-[#1C241E] via-[#262018] to-[#121714]" />
+        )}
 
-        {/* White & Green Login Card */}
-        <div className="lg:col-span-7 w-full max-w-md mx-auto lg:ml-auto">
-          <div className="rounded-[24px] bg-white border border-[#0F7B4F]/15 shadow-sm p-6 sm:p-8">
+        {/* Measured directional scrim: strong legibility on left/mobile, open warmth over the shopkeeper on desktop right */}
+        <div className="absolute inset-0 bg-gradient-to-b from-[#121714]/78 via-[#121714]/44 to-[#121714]/76 lg:bg-gradient-to-r lg:from-[#121714]/86 lg:via-[#121714]/54 lg:to-[#121714]/15" />
+      </div>
+
+      <div className="relative z-10 w-full max-w-6xl mx-auto">
+        <div className="w-full max-w-md mx-auto lg:mx-0 space-y-6">
+          {/* Brand + Welcome Back Header */}
+          <div className="text-center lg:text-left space-y-3">
+            <div className="flex justify-center lg:justify-start">
+              <AuthLogo variant="light-text" />
+            </div>
+            <h1 className="text-3xl sm:text-4xl font-extrabold tracking-tight text-white pt-1 drop-shadow-sm [text-wrap:balance]">
+              Welcome Back!
+            </h1>
+            <p className="text-sm sm:text-base text-white/90 drop-shadow-sm">
+              Sign in with your store mobile number to manage your udhaar khata,
+              voice entries, and customer balances safely.
+            </p>
+          </div>
+
+          {/* White & Green Login Card */}
+          <div className="rounded-[24px] bg-white/95 backdrop-blur-md border border-white/60 shadow-2xl p-6 sm:p-8">
             {successBanner && (
               <div
                 role="status"
