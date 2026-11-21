@@ -498,11 +498,200 @@ export class AudioRecorderSession {
 let activeAudioEl: HTMLAudioElement | null = null;
 let lastSpokenKey = '';
 let lastSpokenAt = 0;
+const activeStreamingPlayers = new Set<StreamingAudioPlayer>();
 
 /**
- * Speaks confirmation text via Gnani Timbre v3.0 TTS when configured on the backend,
- * falling back cleanly to browser SpeechSynthesis if Gnani TTS is not configured.
- * Prevents duplicate back-to-back utterances and supports barge-in via stopSpeaking().
+ * Decodes a base64-encoded signed 16-bit little-endian mono PCM chunk into Float32 samples [-1, 1].
+ * Works in both browser and Node.js runtimes.
+ */
+export function pcm16Base64ToFloat32(base64: string): Float32Array<ArrayBuffer> {
+  const clean = base64.trim();
+  if (!clean) return new Float32Array(new ArrayBuffer(0));
+
+  let bytes: Uint8Array;
+  if (typeof atob === 'function') {
+    const binary = atob(clean);
+    bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+  } else {
+    const buf = Buffer.from(clean, 'base64');
+    bytes = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  }
+
+  const sampleCount = Math.floor(bytes.byteLength / 2);
+  if (sampleCount === 0) return new Float32Array(new ArrayBuffer(0));
+
+  const view = new DataView(bytes.buffer, bytes.byteOffset, sampleCount * 2);
+  const float32 = new Float32Array(new ArrayBuffer(sampleCount * 4));
+  for (let i = 0; i < sampleCount; i++) {
+    float32[i] = view.getInt16(i * 2, true) / 32768;
+  }
+  return float32;
+}
+
+/**
+ * Plays streamed raw 16-bit LE mono PCM audio chunks (Gnani Timbre v3.0 @ 24kHz)
+ * progressively via Web Audio API starting on chunk #1, with instant barge-in stop().
+ */
+export class StreamingAudioPlayer {
+  private audioCtx: AudioContext | null = null;
+  private activeRequestId: string | null = null;
+  private nextStartTime = 0;
+  private activeSources = new Set<AudioBufferSourceNode>();
+  private streamEnded = false;
+  private startedPlayback = false;
+  private onStartCb?: () => void;
+  private onEndCb?: () => void;
+
+  constructor() {
+    activeStreamingPlayers.add(this);
+  }
+
+  private ensureContext(): AudioContext | null {
+    if (typeof window === 'undefined') return null;
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext })
+        .webkitAudioContext;
+    if (!AudioCtx) return null;
+
+    if (!this.audioCtx || this.audioCtx.state === 'closed') {
+      this.audioCtx = new AudioCtx();
+    }
+    if (this.audioCtx.state === 'suspended') {
+      void this.audioCtx.resume().catch(() => {});
+    }
+    return this.audioCtx;
+  }
+
+  isPlaying(): boolean {
+    return this.activeRequestId !== null;
+  }
+
+  getActiveRequestId(): string | null {
+    return this.activeRequestId;
+  }
+
+  beginStream(
+    requestId: string,
+    callbacks?: { onStart?: () => void; onEnd?: () => void }
+  ): void {
+    this.stop();
+    this.activeRequestId = requestId;
+    this.streamEnded = false;
+    this.startedPlayback = false;
+    this.nextStartTime = 0;
+    this.onStartCb = callbacks?.onStart;
+    this.onEndCb = callbacks?.onEnd;
+    this.ensureContext();
+  }
+
+  enqueueChunk(
+    requestId: string,
+    audioBase64: string,
+    sampleRate = 24000
+  ): boolean {
+    if (this.activeRequestId !== requestId) return false;
+    const ctx = this.ensureContext();
+    if (!ctx) return false;
+
+    const samples = pcm16Base64ToFloat32(audioBase64);
+    if (samples.length === 0) return false;
+
+    try {
+      const audioBuffer = ctx.createBuffer(1, samples.length, sampleRate);
+      audioBuffer.copyToChannel(samples, 0);
+
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(ctx.destination);
+
+      const now = ctx.currentTime;
+      const startAt =
+        this.nextStartTime > now + 0.005 ? this.nextStartTime : now + 0.015;
+      this.nextStartTime = startAt + audioBuffer.duration;
+
+      this.activeSources.add(source);
+      source.onended = () => {
+        this.activeSources.delete(source);
+        if (
+          this.activeRequestId === requestId &&
+          this.streamEnded &&
+          this.activeSources.size === 0
+        ) {
+          const endCb = this.onEndCb;
+          this.activeRequestId = null;
+          this.streamEnded = false;
+          this.startedPlayback = false;
+          this.nextStartTime = 0;
+          this.onStartCb = undefined;
+          this.onEndCb = undefined;
+          endCb?.();
+        }
+      };
+
+      if (!this.startedPlayback) {
+        this.startedPlayback = true;
+        this.onStartCb?.();
+      }
+
+      source.start(startAt);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  endStream(requestId: string): void {
+    if (this.activeRequestId !== requestId) return;
+    this.streamEnded = true;
+    if (this.activeSources.size === 0) {
+      const endCb = this.onEndCb;
+      this.activeRequestId = null;
+      this.streamEnded = false;
+      this.startedPlayback = false;
+      this.nextStartTime = 0;
+      this.onStartCb = undefined;
+      this.onEndCb = undefined;
+      endCb?.();
+    }
+  }
+
+  stop(): void {
+    this.activeRequestId = null;
+    this.streamEnded = false;
+    this.startedPlayback = false;
+    this.nextStartTime = 0;
+    this.onStartCb = undefined;
+    this.onEndCb = undefined;
+    for (const source of this.activeSources) {
+      try {
+        source.onended = null;
+        source.stop();
+        source.disconnect();
+      } catch {
+        // ignore already-stopped sources
+      }
+    }
+    this.activeSources.clear();
+  }
+
+  dispose(): void {
+    this.stop();
+    activeStreamingPlayers.delete(this);
+    if (this.audioCtx) {
+      this.audioCtx.close().catch(() => {});
+      this.audioCtx = null;
+    }
+  }
+}
+
+/**
+ * Speaks confirmation text via Gnani Timbre v3.0 REST TTS when called as fallback
+ * (when /ws/voice streaming is unavailable), falling back cleanly to browser SpeechSynthesis
+ * if Gnani TTS is not configured. Prevents duplicate back-to-back utterances and supports barge-in.
  */
 export async function speakConfirmation(
   text: string,
@@ -581,6 +770,9 @@ export function speakText(
 }
 
 export function stopSpeaking(): void {
+  for (const player of activeStreamingPlayers) {
+    player.stop();
+  }
   if (activeAudioEl) {
     try {
       activeAudioEl.pause();
@@ -600,8 +792,9 @@ export function stopSpeaking(): void {
 }
 
 /**
- * Manages authenticated WebSocket streaming of 16kHz PCM16 audio frames to `/ws/voice`
- * (or a custom configured WebSocket URL) with automatic reconnection.
+ * Manages authenticated WebSocket streaming of 16kHz PCM16 STT audio frames and
+ * 24kHz PCM16 Timbre v3.0 TTS audio streams over `/ws/voice` with 25s keepalive
+ * and resilient reconnection across mobile backgrounding/network drops.
  */
 export class VoiceWsClient {
   private ws: WebSocket | null = null;
@@ -610,10 +803,74 @@ export class VoiceWsClient {
   private intentionallyClosed = false;
   private reconnectAttempts = 0;
   private reconnectTimer: number | null = null;
+  private pingTimer: number | null = null;
+  private ttsSeq = 0;
   private callbacks: VoiceClientCallbacks;
+  private listenersAttached = false;
 
   constructor(callbacks: VoiceClientCallbacks) {
     this.callbacks = callbacks;
+  }
+
+  private handleOnline = () => {
+    if (!this.intentionallyClosed && !this.isConnected()) {
+      this.reconnectAttempts = 0;
+      this.reconnect();
+    }
+  };
+
+  private handleVisibilityChange = () => {
+    if (
+      typeof document !== 'undefined' &&
+      document.visibilityState === 'visible' &&
+      !this.intentionallyClosed &&
+      !this.isConnected()
+    ) {
+      this.reconnectAttempts = 0;
+      this.reconnect();
+    }
+  };
+
+  private attachNetworkListeners(): void {
+    if (this.listenersAttached || typeof window === 'undefined') return;
+    window.addEventListener('online', this.handleOnline);
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', this.handleVisibilityChange);
+    }
+    this.listenersAttached = true;
+  }
+
+  private detachNetworkListeners(): void {
+    if (!this.listenersAttached || typeof window === 'undefined') return;
+    window.removeEventListener('online', this.handleOnline);
+    if (typeof document !== 'undefined') {
+      document.removeEventListener(
+        'visibilitychange',
+        this.handleVisibilityChange
+      );
+    }
+    this.listenersAttached = false;
+  }
+
+  private stopPing(): void {
+    if (this.pingTimer !== null) {
+      window.clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+  }
+
+  private startPing(): void {
+    this.stopPing();
+    if (typeof window === 'undefined') return;
+    this.pingTimer = window.setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        try {
+          this.ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+        } catch {
+          // ignore
+        }
+      }
+    }, 25_000);
   }
 
   isConnected(): boolean {
@@ -626,11 +883,31 @@ export class VoiceWsClient {
     this.language = language;
     this.intentionallyClosed = false;
     this.reconnectAttempts = 0;
+    this.attachNetworkListeners();
+    this.openSocket();
+  }
+
+  reconnect(): void {
+    if (!this.url || this.intentionallyClosed) return;
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (
+      this.ws &&
+      (this.ws.readyState === WebSocket.OPEN ||
+        this.ws.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
     this.openSocket();
   }
 
   updateLanguage(language: LanguageCode): void {
     this.language = language;
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'update_language', language }));
+    }
   }
 
   private openSocket(): void {
@@ -641,7 +918,17 @@ export class VoiceWsClient {
       this.ws = ws;
 
       ws.onopen = () => {
+        if (this.ws !== ws) return;
         this.reconnectAttempts = 0;
+        this.startPing();
+        // Sync current language immediately on open so server matches UI language
+        try {
+          ws.send(
+            JSON.stringify({ type: 'update_language', language: this.language })
+          );
+        } catch {
+          // ignore
+        }
         this.callbacks.onStatusChange(true);
       };
 
@@ -649,6 +936,7 @@ export class VoiceWsClient {
         if (typeof event.data === 'string') {
           try {
             const msg = JSON.parse(event.data) as WsServerMessage;
+            if (msg.type === 'pong') return;
             this.callbacks.onMessage(msg);
           } catch {
             // Ignore malformed JSON frames
@@ -657,14 +945,20 @@ export class VoiceWsClient {
       };
 
       ws.onerror = () => {
+        if (this.ws !== ws) return;
         this.callbacks.onStatusChange(false);
       };
 
       ws.onclose = () => {
+        if (this.ws !== ws) return;
+        this.stopPing();
         this.callbacks.onStatusChange(false);
         this.ws = null;
-        if (!this.intentionallyClosed && this.reconnectAttempts < 4) {
-          const delay = Math.min(8000, 1000 * Math.pow(2, this.reconnectAttempts));
+        if (!this.intentionallyClosed && this.reconnectAttempts < 12) {
+          const delay = Math.min(
+            10_000,
+            Math.round(1000 * Math.pow(1.6, this.reconnectAttempts))
+          );
           this.reconnectAttempts += 1;
           this.reconnectTimer = window.setTimeout(() => {
             this.openSocket();
@@ -718,6 +1012,34 @@ export class VoiceWsClient {
     }
   }
 
+  requestTts(text: string, language?: LanguageCode): string | null {
+    const clean = text.trim();
+    if (!clean || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return null;
+    }
+    const requestId = `tts-${Date.now()}-${++this.ttsSeq}`;
+    this.ws.send(
+      JSON.stringify({
+        type: 'tts_request',
+        requestId,
+        text: clean,
+        language: language || this.language,
+      })
+    );
+    return requestId;
+  }
+
+  cancelTts(requestId?: string): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(
+        JSON.stringify({
+          type: 'tts_cancel',
+          ...(requestId ? { requestId } : {}),
+        })
+      );
+    }
+  }
+
   sendTextTurn(text: string, hasPendingConfirmation = false): boolean {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(
@@ -734,6 +1056,8 @@ export class VoiceWsClient {
 
   disconnect(): void {
     this.intentionallyClosed = true;
+    this.stopPing();
+    this.detachNetworkListeners();
     if (this.reconnectTimer !== null) {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

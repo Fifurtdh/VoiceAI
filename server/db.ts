@@ -45,6 +45,54 @@ export interface LedgerEntryRow {
   created_at: string;
   note: string | null;
   undone: number;
+  reversal_of_id?: string | null;
+  client_request_id?: string | null;
+}
+
+export interface ChatSessionRow {
+  id: string;
+  store_id: number;
+  title: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChatMessageRow {
+  id: string;
+  session_id: string;
+  store_id: number;
+  role: 'user' | 'assistant';
+  content: string;
+  metadata_json: string | null;
+  created_at: string;
+}
+
+export interface PaymentReminderRow {
+  id: string;
+  store_id: number;
+  customer_id: string;
+  customer_name: string;
+  amount_due: number;
+  language: string;
+  message: string;
+  channel: string;
+  status: 'draft' | 'opened_whatsapp' | 'marked_sent' | 'customer_responded';
+  customer_response: string | null;
+  created_at: string;
+  sent_at: string | null;
+}
+
+export interface AuditLogRow {
+  id: string;
+  store_id: number;
+  user_id: number | null;
+  action: string;
+  entity_type: string;
+  entity_id: string;
+  before_json: string | null;
+  after_json: string | null;
+  reason: string | null;
+  created_at: string;
 }
 
 const DEFAULT_DB_PATH =
@@ -111,7 +159,9 @@ export function openDatabase(dbPath: string = DEFAULT_DB_PATH): Database.Databas
       date TEXT NOT NULL,
       created_at TEXT NOT NULL,
       note TEXT,
-      undone INTEGER NOT NULL DEFAULT 0
+      undone INTEGER NOT NULL DEFAULT 0,
+      reversal_of_id TEXT,
+      client_request_id TEXT
     );
 
     CREATE TABLE IF NOT EXISTS system_config (
@@ -119,11 +169,63 @@ export function openDatabase(dbPath: string = DEFAULT_DB_PATH): Database.Databas
       value TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS chat_sessions (
+      id TEXT PRIMARY KEY,
+      store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+      store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+      role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+      content TEXT NOT NULL,
+      metadata_json TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS payment_reminders (
+      id TEXT PRIMARY KEY,
+      store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+      customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+      customer_name TEXT NOT NULL,
+      amount_due INTEGER NOT NULL,
+      language TEXT NOT NULL DEFAULT 'en',
+      message TEXT NOT NULL,
+      channel TEXT NOT NULL DEFAULT 'whatsapp',
+      status TEXT NOT NULL CHECK(status IN ('draft', 'opened_whatsapp', 'marked_sent', 'customer_responded')),
+      customer_response TEXT,
+      created_at TEXT NOT NULL,
+      sent_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id TEXT PRIMARY KEY,
+      store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+      user_id INTEGER,
+      action TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      before_json TEXT,
+      after_json TEXT,
+      reason TEXT,
+      created_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_customers_store ON customers(store_id);
     CREATE INDEX IF NOT EXISTS idx_entries_store_created ON ledger_entries(store_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_entries_store_date ON ledger_entries(store_id, date DESC);
+    CREATE INDEX IF NOT EXISTS idx_chat_sessions_store ON chat_sessions(store_id, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id, created_at ASC);
+    CREATE INDEX IF NOT EXISTS idx_reminders_store ON payment_reminders(store_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_reminders_customer ON payment_reminders(store_id, customer_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_store ON audit_logs(store_id, created_at DESC);
   `);
 
-  // Non-destructive migration in case an existing SQLite DB has an older users/stores table
+  // Non-destructive migration in case an existing SQLite DB has older tables
   const userCols = db
     .prepare("PRAGMA table_info('users')")
     .all() as Array<{ name: string }>;
@@ -146,6 +248,22 @@ export function openDatabase(dbPath: string = DEFAULT_DB_PATH): Database.Databas
       db.exec(`ALTER TABLE stores ADD COLUMN ${col} ${def};`);
     }
   }
+
+  const entryCols = db
+    .prepare("PRAGMA table_info('ledger_entries')")
+    .all() as Array<{ name: string }>;
+  const entryMigrations: Array<[string, string]> = [
+    ['reversal_of_id', 'TEXT'],
+    ['client_request_id', 'TEXT'],
+  ];
+  for (const [col, def] of entryMigrations) {
+    if (!entryCols.some((c) => c.name === col)) {
+      db.exec(`ALTER TABLE ledger_entries ADD COLUMN ${col} ${def};`);
+    }
+  }
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_entries_store_reqid ON ledger_entries(store_id, client_request_id);'
+  );
 
   return db;
 }

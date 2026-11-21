@@ -179,17 +179,31 @@ export function createSampleSeedData(now: Date = new Date()): {
   return { customers, entries };
 }
 
+function getSupersededIds(entries: LedgerEntry[]): Set<string> {
+  const superseded = new Set<string>();
+  for (const e of entries) {
+    if (!e.undone && e.reversalOfId) {
+      superseded.add(e.reversalOfId);
+    }
+  }
+  return superseded;
+}
+
 /**
  * Computes net balance for a customer.
  * Positive = customer owes shopkeeper (outstanding udhaar).
  * Zero = settled. Negative = advance paid.
+ * Excludes undone entries and entries superseded by an active replacement (`reversalOfId`).
  */
 export function computeCustomerBalance(
   customerId: string,
   entries: LedgerEntry[]
 ): number {
+  const superseded = getSupersededIds(entries);
   return entries.reduce((sum, entry) => {
-    if (entry.customerId !== customerId || entry.undone) return sum;
+    if (entry.customerId !== customerId || entry.undone || superseded.has(entry.id)) {
+      return sum;
+    }
     return entry.direction === 'credit' ? sum + entry.amount : sum - entry.amount;
   }, 0);
 }
@@ -201,6 +215,7 @@ export function computeCustomerSummaries(
   customers: Customer[],
   entries: LedgerEntry[]
 ): CustomerSummary[] {
+  const superseded = getSupersededIds(entries);
   const sortedEntries = [...entries].sort((a, b) =>
     b.createdAt.localeCompare(a.createdAt)
   );
@@ -208,7 +223,7 @@ export function computeCustomerSummaries(
   return customers
     .map((customer) => {
       const custEntries = sortedEntries.filter(
-        (e) => e.customerId === customer.id && !e.undone
+        (e) => e.customerId === customer.id && !e.undone && !superseded.has(e.id)
       );
       const balance = custEntries.reduce(
         (acc, e) => (e.direction === 'credit' ? acc + e.amount : acc - e.amount),
@@ -232,11 +247,12 @@ export function computeDashboardTotals(
   entries: LedgerEntry[],
   todayISO: string = getTodayISO()
 ): DashboardTotals {
+  const superseded = getSupersededIds(entries);
   let todayCredit = 0;
   let todayPayments = 0;
 
   for (const entry of entries) {
-    if (entry.undone) continue;
+    if (entry.undone || superseded.has(entry.id)) continue;
     if (entry.date === todayISO) {
       if (entry.direction === 'credit') {
         todayCredit += entry.amount;

@@ -34,6 +34,23 @@ import {
   type ReportPeriodType,
 } from '../src/utils/ledgerLogic.ts';
 import type { LanguageCode } from '../src/types/khata.ts';
+import {
+  computeCustomerIntelligence,
+  computeCustomerStatement,
+  computeEnhancedReport,
+  createChatSession,
+  findPotentialDuplicateEntries,
+  generateSmartReminderMessage,
+  getChatSessionMessages,
+  getRemindersOverview,
+  handleBusinessChatTurn,
+  listAuditLogs,
+  listChatSessions,
+  searchTransactionsSmart,
+  writeAuditLog,
+  type ReminderLanguage,
+} from './businessIntelligence.ts';
+import type { PaymentReminderRow } from './db.ts';
 
 function mapStore(row: StoreRow) {
   return {
@@ -71,6 +88,7 @@ function mapEntry(row: LedgerEntryRow) {
     createdAt: row.created_at,
     note: row.note ?? undefined,
     undone: Boolean(row.undone),
+    reversalOfId: row.reversal_of_id ?? undefined,
   };
 }
 
@@ -465,11 +483,49 @@ export function createApiApp(db: Database.Database): express.Express {
   });
 
   /**
+   * POST /api/entries/check-duplicate
+   * Detects potential duplicate entries (same customer, amount, direction on same date or within 15 min)
+   * without auto-blocking legitimate repeat purchases.
+   */
+  app.post(
+    '/api/entries/check-duplicate',
+    requireAuth,
+    (req: AuthenticatedRequest, res) => {
+      const { storeId } = req.auth!;
+      const body = req.body ?? {};
+      const customerName =
+        typeof body.customerName === 'string' ? body.customerName.trim() : '';
+      const amount = Number(body.amount);
+      const direction = body.direction;
+      const date =
+        typeof body.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(body.date)
+          ? body.date
+          : new Date().toISOString().slice(0, 10);
+
+      if (!customerName || !Number.isFinite(amount) || amount <= 0 || (direction !== 'credit' && direction !== 'payment')) {
+        res.json({ isDuplicate: false, matches: [] });
+        return;
+      }
+
+      const matches = findPotentialDuplicateEntries(db, storeId, {
+        customerId: typeof body.customerId === 'string' ? body.customerId.trim() : undefined,
+        customerName,
+        amount,
+        direction,
+        date,
+      });
+
+      res.json({ isDuplicate: matches.length > 0, matches });
+    }
+  );
+
+  /**
    * POST /api/entries
    * Adds a new entry (and creates customer if needed) scoped to the authenticated store.
+   * Supports idempotent clientRequestId, optional duplicate guard, and audit logging.
    */
   app.post('/api/entries', requireAuth, (req: AuthenticatedRequest, res) => {
-    const { storeId } = req.auth!;
+    const { userId, storeId } = req.auth!;
     const body = req.body ?? {};
     const customerName =
       typeof body.customerName === 'string' && body.customerName.trim().length > 0
@@ -485,6 +541,10 @@ export function createApiApp(db: Database.Database): express.Express {
       typeof body.note === 'string' && body.note.trim()
         ? body.note.trim().slice(0, 160)
         : null;
+    const clientRequestId =
+      typeof body.clientRequestId === 'string' && body.clientRequestId.trim()
+        ? body.clientRequestId.trim().slice(0, 80)
+        : null;
 
     if (!Number.isFinite(amount) || amount <= 0) {
       res.status(400).json({ error: 'Amount must be greater than zero.' });
@@ -493,6 +553,45 @@ export function createApiApp(db: Database.Database): express.Express {
     if (direction !== 'credit' && direction !== 'payment') {
       res.status(400).json({ error: 'Invalid transaction direction.' });
       return;
+    }
+
+    // Idempotency protection: return existing entry if same clientRequestId already committed
+    if (clientRequestId) {
+      const existingByReq = db
+        .prepare(
+          'SELECT * FROM ledger_entries WHERE store_id = ? AND client_request_id = ?'
+        )
+        .get(storeId, clientRequestId) as LedgerEntryRow | undefined;
+      if (existingByReq) {
+        const cust = db
+          .prepare('SELECT * FROM customers WHERE id = ? AND store_id = ?')
+          .get(existingByReq.customer_id, storeId) as CustomerRow;
+        res.status(200).json({
+          customer: mapCustomer(cust),
+          entry: mapEntry(existingByReq),
+          deduplicated: true,
+        });
+        return;
+      }
+    }
+
+    // Optional duplicate check when requested by client before explicit confirmation
+    if (body.checkDuplicate === true && body.confirmDuplicate !== true) {
+      const matches = findPotentialDuplicateEntries(db, storeId, {
+        customerId: typeof body.customerId === 'string' ? body.customerId.trim() : undefined,
+        customerName,
+        amount,
+        direction,
+        date,
+      });
+      if (matches.length > 0) {
+        res.status(409).json({
+          code: 'POTENTIAL_DUPLICATE',
+          error: `A matching ₹${Math.round(amount)} ${direction} entry for ${matches[0].customerName} was already recorded on ${matches[0].date}. Please confirm to save anyway.`,
+          duplicates: matches,
+        });
+        return;
+      }
     }
 
     const nowIso = new Date().toISOString();
@@ -529,8 +628,8 @@ export function createApiApp(db: Database.Database): express.Express {
         .toString(36)
         .slice(2, 6)}`;
       db.prepare(
-        `INSERT INTO ledger_entries (id, store_id, customer_id, customer_name, amount, direction, date, created_at, note, undone)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+        `INSERT INTO ledger_entries (id, store_id, customer_id, customer_name, amount, direction, date, created_at, note, undone, client_request_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
       ).run(
         newEntryId,
         storeId,
@@ -540,12 +639,23 @@ export function createApiApp(db: Database.Database): express.Express {
         direction,
         date,
         nowIso,
-        note
+        note,
+        clientRequestId
       );
 
       const createdEntry = db
         .prepare('SELECT * FROM ledger_entries WHERE id = ?')
         .get(newEntryId) as LedgerEntryRow;
+
+      writeAuditLog(db, {
+        storeId,
+        userId,
+        action: 'entry_created',
+        entityType: 'ledger_entry',
+        entityId: newEntryId,
+        after: mapEntry(createdEntry),
+        reason: body.confirmDuplicate ? 'Confirmed after duplicate warning' : null,
+      });
 
       return { customer, createdEntry };
     });
@@ -558,11 +668,111 @@ export function createApiApp(db: Database.Database): express.Express {
   });
 
   /**
+   * POST /api/entries/:id/reverse
+   * Auditable reversal or correction of a committed entry.
+   * Marks the original entry undone (preserving history) and optionally inserts a corrected entry
+   * inside one atomic SQLite transaction with full audit trail.
+   */
+  app.post(
+    '/api/entries/:id/reverse',
+    requireAuth,
+    (req: AuthenticatedRequest, res) => {
+      const { userId, storeId } = req.auth!;
+      const entryId = req.params.id;
+      const current = db
+        .prepare('SELECT * FROM ledger_entries WHERE id = ? AND store_id = ?')
+        .get(entryId, storeId) as LedgerEntryRow | undefined;
+
+      if (!current) {
+        res.status(404).json({ error: 'Entry not found.' });
+        return;
+      }
+
+      const body = req.body ?? {};
+      const reason =
+        typeof body.reason === 'string' && body.reason.trim()
+          ? body.reason.trim().slice(0, 160)
+          : 'Reversed by shopkeeper';
+      const hasReplacement =
+        body.replacementAmount !== undefined &&
+        Number.isFinite(Number(body.replacementAmount)) &&
+        Number(body.replacementAmount) > 0;
+
+      const nowIso = new Date().toISOString();
+
+      const tx = db.transaction(() => {
+        db.prepare(
+          'UPDATE ledger_entries SET undone = 1 WHERE id = ? AND store_id = ?'
+        ).run(entryId, storeId);
+
+        const reversedRow = db
+          .prepare('SELECT * FROM ledger_entries WHERE id = ?')
+          .get(entryId) as LedgerEntryRow;
+
+        let replacementRow: LedgerEntryRow | null = null;
+        if (hasReplacement) {
+          const repId = `ent-${storeId}-${Date.now()}-${Math.random()
+            .toString(36)
+            .slice(2, 6)}`;
+          const repAmount = Math.max(1, Math.round(Number(body.replacementAmount)));
+          const repDirection =
+            body.replacementDirection === 'credit' ||
+            body.replacementDirection === 'payment'
+              ? body.replacementDirection
+              : current.direction;
+          const repNote =
+            typeof body.replacementNote === 'string' && body.replacementNote.trim()
+              ? body.replacementNote.trim().slice(0, 160)
+              : `Correction of ₹${current.amount} (${reason})`;
+
+          db.prepare(
+            `INSERT INTO ledger_entries (id, store_id, customer_id, customer_name, amount, direction, date, created_at, note, undone, reversal_of_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
+          ).run(
+            repId,
+            storeId,
+            current.customer_id,
+            current.customer_name,
+            repAmount,
+            repDirection,
+            current.date,
+            nowIso,
+            repNote,
+            current.id
+          );
+          replacementRow = db
+            .prepare('SELECT * FROM ledger_entries WHERE id = ?')
+            .get(repId) as LedgerEntryRow;
+        }
+
+        writeAuditLog(db, {
+          storeId,
+          userId,
+          action: hasReplacement ? 'entry_corrected' : 'entry_reversed',
+          entityType: 'ledger_entry',
+          entityId: entryId,
+          before: mapEntry(current),
+          after: replacementRow ? mapEntry(replacementRow) : mapEntry(reversedRow),
+          reason,
+        });
+
+        return { reversedRow, replacementRow };
+      });
+
+      const out = tx();
+      res.json({
+        reversedEntry: mapEntry(out.reversedRow),
+        replacementEntry: out.replacementRow ? mapEntry(out.replacementRow) : null,
+      });
+    }
+  );
+
+  /**
    * PATCH /api/entries/:id
-   * Edits an existing entry owned by the authenticated store.
+   * Edits an existing entry owned by the authenticated store (with audit log).
    */
   app.patch('/api/entries/:id', requireAuth, (req: AuthenticatedRequest, res) => {
-    const { storeId } = req.auth!;
+    const { userId, storeId } = req.auth!;
     const entryId = req.params.id;
     const current = db
       .prepare('SELECT * FROM ledger_entries WHERE id = ? AND store_id = ?')
@@ -593,22 +803,38 @@ export function createApiApp(db: Database.Database): express.Express {
         ? body.note.trim().slice(0, 160)
         : null;
 
-    db.prepare(
-      'UPDATE ledger_entries SET amount = ?, direction = ?, date = ?, note = ? WHERE id = ? AND store_id = ?'
-    ).run(amount, direction, date, note, entryId, storeId);
+    const tx = db.transaction(() => {
+      db.prepare(
+        'UPDATE ledger_entries SET amount = ?, direction = ?, date = ?, note = ? WHERE id = ? AND store_id = ?'
+      ).run(amount, direction, date, note, entryId, storeId);
 
-    const updated = db
-      .prepare('SELECT * FROM ledger_entries WHERE id = ?')
-      .get(entryId) as LedgerEntryRow;
+      const updated = db
+        .prepare('SELECT * FROM ledger_entries WHERE id = ?')
+        .get(entryId) as LedgerEntryRow;
+
+      writeAuditLog(db, {
+        storeId,
+        userId,
+        action: 'entry_edited',
+        entityType: 'ledger_entry',
+        entityId: entryId,
+        before: mapEntry(current),
+        after: mapEntry(updated),
+      });
+
+      return updated;
+    });
+
+    const updated = tx();
     res.json({ entry: mapEntry(updated) });
   });
 
   /**
    * POST /api/entries/:id/undo
-   * Toggles undone flag on an entry owned by the authenticated store.
+   * Toggles undone flag on an entry owned by the authenticated store (with audit log).
    */
   app.post('/api/entries/:id/undo', requireAuth, (req: AuthenticatedRequest, res) => {
-    const { storeId } = req.auth!;
+    const { userId, storeId } = req.auth!;
     const entryId = req.params.id;
     const current = db
       .prepare('SELECT * FROM ledger_entries WHERE id = ? AND store_id = ?')
@@ -620,30 +846,77 @@ export function createApiApp(db: Database.Database): express.Express {
     }
 
     const nextUndone = current.undone ? 0 : 1;
-    db.prepare(
-      'UPDATE ledger_entries SET undone = ? WHERE id = ? AND store_id = ?'
-    ).run(nextUndone, entryId, storeId);
+    if (nextUndone === 0) {
+      const activeReplacement = db
+        .prepare(
+          'SELECT id FROM ledger_entries WHERE store_id = ? AND reversal_of_id = ? AND COALESCE(undone, 0) = 0 LIMIT 1'
+        )
+        .get(storeId, entryId) as { id: string } | undefined;
+      if (activeReplacement) {
+        res.status(409).json({
+          error:
+            'This entry was already superseded by a corrected entry. Undo or reverse the corrected entry first to avoid double-counting.',
+        });
+        return;
+      }
+    }
 
-    const updated = db
-      .prepare('SELECT * FROM ledger_entries WHERE id = ?')
-      .get(entryId) as LedgerEntryRow;
+    const tx = db.transaction(() => {
+      db.prepare(
+        'UPDATE ledger_entries SET undone = ? WHERE id = ? AND store_id = ?'
+      ).run(nextUndone, entryId, storeId);
+
+      const updated = db
+        .prepare('SELECT * FROM ledger_entries WHERE id = ?')
+        .get(entryId) as LedgerEntryRow;
+
+      writeAuditLog(db, {
+        storeId,
+        userId,
+        action: nextUndone ? 'entry_undone' : 'entry_restored',
+        entityType: 'ledger_entry',
+        entityId: entryId,
+        before: mapEntry(current),
+        after: mapEntry(updated),
+      });
+
+      return updated;
+    });
+
+    const updated = tx();
     res.json({ entry: mapEntry(updated) });
   });
 
   /**
    * DELETE /api/entries/:id
-   * Deletes an entry owned by the authenticated store.
+   * Deletes an entry owned by the authenticated store (with audit log).
    */
   app.delete('/api/entries/:id', requireAuth, (req: AuthenticatedRequest, res) => {
-    const { storeId } = req.auth!;
-    const info = db
-      .prepare('DELETE FROM ledger_entries WHERE id = ? AND store_id = ?')
-      .run(req.params.id, storeId);
+    const { userId, storeId } = req.auth!;
+    const current = db
+      .prepare('SELECT * FROM ledger_entries WHERE id = ? AND store_id = ?')
+      .get(req.params.id, storeId) as LedgerEntryRow | undefined;
 
-    if (info.changes === 0) {
+    if (!current) {
       res.status(404).json({ error: 'Entry not found.' });
       return;
     }
+
+    const tx = db.transaction(() => {
+      db.prepare('DELETE FROM ledger_entries WHERE id = ? AND store_id = ?').run(
+        req.params.id,
+        storeId
+      );
+      writeAuditLog(db, {
+        storeId,
+        userId,
+        action: 'entry_deleted',
+        entityType: 'ledger_entry',
+        entityId: current.id,
+        before: mapEntry(current),
+      });
+    });
+    tx();
     res.json({ ok: true });
   });
 
@@ -947,6 +1220,452 @@ export function createApiApp(db: Database.Database): express.Express {
   });
 
   // =========================================================================
+  // BUSINESS INTELLIGENCE, CUSTOMER INSIGHTS, SMART SEARCH, REMINDERS & CHAT
+  // =========================================================================
+
+  /**
+   * GET /api/reports/enhanced
+   * Full daily/weekly/monthly/custom BI analytics with previous-period comparisons,
+   * daily chart series, top customers, increasing balances, and exportable transaction list.
+   */
+  app.get('/api/reports/enhanced', requireAuth, (req: AuthenticatedRequest, res) => {
+    const { storeId } = req.auth!;
+    const rawPeriod = String(req.query.period || 'daily');
+    const period: ReportPeriodType =
+      rawPeriod === 'weekly' || rawPeriod === 'monthly' || rawPeriod === 'custom'
+        ? rawPeriod
+        : 'daily';
+
+    const report = computeEnhancedReport(db, storeId, {
+      period,
+      startDate:
+        typeof req.query.startDate === 'string' ? req.query.startDate : undefined,
+      endDate:
+        typeof req.query.endDate === 'string' ? req.query.endDate : undefined,
+    });
+    res.json({ report });
+  });
+
+  /**
+   * GET /api/customers/intelligence
+   * Returns enriched customer intelligence profiles, insight segments,
+   * and optional natural-language smart customer search (?q=...).
+   */
+  app.get(
+    '/api/customers/intelligence',
+    requireAuth,
+    (req: AuthenticatedRequest, res) => {
+      const { storeId } = req.auth!;
+      const q = typeof req.query.q === 'string' ? req.query.q : '';
+      const result = computeCustomerIntelligence(db, storeId, q);
+      res.json(result);
+    }
+  );
+
+  /**
+   * GET /api/customers/:id/statement
+   * Returns complete customer profile with running-balance ledger, timestamps,
+   * monthly activity, and optional date/search filters.
+   */
+  app.get(
+    '/api/customers/:id/statement',
+    requireAuth,
+    (req: AuthenticatedRequest, res) => {
+      const { storeId } = req.auth!;
+      const statement = computeCustomerStatement(db, storeId, req.params.id, {
+        startDate:
+          typeof req.query.startDate === 'string' ? req.query.startDate : undefined,
+        endDate:
+          typeof req.query.endDate === 'string' ? req.query.endDate : undefined,
+        search:
+          typeof req.query.search === 'string' ? req.query.search : undefined,
+      });
+
+      if (!statement) {
+        res.status(404).json({ error: 'Customer not found.' });
+        return;
+      }
+      res.json({ statement });
+    }
+  );
+
+  /**
+   * GET /api/entries/search
+   * Natural-language smart transaction search ("yesterday's payments", "above 1,000 rupees", etc.).
+   */
+  app.get('/api/entries/search', requireAuth, (req: AuthenticatedRequest, res) => {
+    const { storeId } = req.auth!;
+    const q = typeof req.query.q === 'string' ? req.query.q : '';
+    const dirParam = req.query.direction;
+    const direction =
+      dirParam === 'credit' || dirParam === 'payment' ? dirParam : 'all';
+
+    const result = searchTransactionsSmart(db, storeId, q, {
+      direction,
+      startDate:
+        typeof req.query.startDate === 'string' ? req.query.startDate : undefined,
+      endDate:
+        typeof req.query.endDate === 'string' ? req.query.endDate : undefined,
+      includeUndone: req.query.includeUndone !== 'false',
+    });
+    res.json(result);
+  });
+
+  /**
+   * GET /api/audit-logs
+   * Returns recent auditable financial mutation logs strictly for the authenticated store.
+   */
+  app.get('/api/audit-logs', requireAuth, (req: AuthenticatedRequest, res) => {
+    const { storeId } = req.auth!;
+    const limit = Number(req.query.limit) || 40;
+    const logs = listAuditLogs(db, storeId, limit);
+    res.json({ logs });
+  });
+
+  // ---- KHATA AI ASSISTANT CHATBOT ROUTES ----
+
+  app.get('/api/chat/sessions', requireAuth, (req: AuthenticatedRequest, res) => {
+    const { storeId } = req.auth!;
+    res.json({ sessions: listChatSessions(db, storeId) });
+  });
+
+  app.post('/api/chat/sessions', requireAuth, (req: AuthenticatedRequest, res) => {
+    const { storeId } = req.auth!;
+    const title =
+      typeof req.body?.title === 'string' && req.body.title.trim()
+        ? req.body.title.trim().slice(0, 80)
+        : 'New Khata Chat';
+    const session = createChatSession(db, storeId, title);
+    res.status(201).json({ session });
+  });
+
+  app.get(
+    '/api/chat/sessions/:id/messages',
+    requireAuth,
+    (req: AuthenticatedRequest, res) => {
+      const { storeId } = req.auth!;
+      const messages = getChatSessionMessages(db, storeId, req.params.id);
+      if (!messages) {
+        res.status(404).json({ error: 'Chat session not found.' });
+        return;
+      }
+      res.json({ messages });
+    }
+  );
+
+  app.delete(
+    '/api/chat/sessions/:id',
+    requireAuth,
+    (req: AuthenticatedRequest, res) => {
+      const { storeId } = req.auth!;
+      const info = db
+        .prepare('DELETE FROM chat_sessions WHERE id = ? AND store_id = ?')
+        .run(req.params.id, storeId);
+      if (info.changes === 0) {
+        res.status(404).json({ error: 'Chat session not found.' });
+        return;
+      }
+      res.json({ ok: true });
+    }
+  );
+
+  app.post(
+    '/api/chat/message',
+    requireAuth,
+    async (req: AuthenticatedRequest, res) => {
+      try {
+        const { userId, storeId } = req.auth!;
+        const body = req.body ?? {};
+        const message =
+          typeof body.message === 'string' ? body.message.trim() : '';
+        if (!message) {
+          res.status(400).json({ error: 'Please enter a question for Khata AI Assistant.' });
+          return;
+        }
+
+        const store = db
+          .prepare('SELECT * FROM stores WHERE id = ? AND user_id = ?')
+          .get(storeId, userId) as StoreRow | undefined;
+        if (!store) {
+          res.status(404).json({ error: 'Store not found.' });
+          return;
+        }
+
+        const allowedLangs = new Set(['hi', 'kn', 'ta', 'te', 'mr', 'bn', 'en']);
+        const language: LanguageCode | undefined = allowedLangs.has(body.language)
+          ? (body.language as LanguageCode)
+          : undefined;
+        const storeLang: LanguageCode = allowedLangs.has(store.language)
+          ? (store.language as LanguageCode)
+          : 'en';
+
+        const result = await handleBusinessChatTurn(
+          db,
+          storeId,
+          store.store_name,
+          storeLang,
+          {
+            sessionId:
+              typeof body.sessionId === 'string' ? body.sessionId.trim() : undefined,
+            message,
+            language,
+          }
+        );
+
+        res.json(result);
+      } catch (err) {
+        console.error('Khata AI chat error:', err);
+        res.status(500).json({ error: 'Could not answer right now. Please retry.' });
+      }
+    }
+  );
+
+  // ---- SMART PAYMENT REMINDERS ROUTES ----
+
+  app.get(
+    '/api/reminders/overview',
+    requireAuth,
+    (req: AuthenticatedRequest, res) => {
+      const { storeId } = req.auth!;
+      const sortBy = req.query.sort === 'overdue' ? 'overdue' : 'amount';
+      res.json(getRemindersOverview(db, storeId, sortBy));
+    }
+  );
+
+  app.post(
+    '/api/reminders/generate',
+    requireAuth,
+    async (req: AuthenticatedRequest, res) => {
+      try {
+        const { userId, storeId } = req.auth!;
+        const body = req.body ?? {};
+        const customerId =
+          typeof body.customerId === 'string' ? body.customerId.trim() : '';
+        if (!customerId) {
+          res.status(400).json({ error: 'Customer ID is required.' });
+          return;
+        }
+
+        const store = db
+          .prepare('SELECT * FROM stores WHERE id = ? AND user_id = ?')
+          .get(storeId, userId) as StoreRow | undefined;
+        const customer = db
+          .prepare('SELECT * FROM customers WHERE id = ? AND store_id = ?')
+          .get(customerId, storeId) as CustomerRow | undefined;
+
+        if (!store || !customer) {
+          res.status(404).json({ error: 'Customer not found.' });
+          return;
+        }
+
+        const statement = computeCustomerStatement(db, storeId, customerId);
+        const amountDue = Math.max(0, statement?.summary.outstanding ?? 0);
+        if (amountDue <= 0) {
+          res.status(400).json({
+            error: `${customer.name} currently has no pending balance to remind.`,
+          });
+          return;
+        }
+
+        const allowedReminderLangs = new Set([
+          'hi',
+          'hinglish',
+          'kn',
+          'en',
+          'ta',
+          'te',
+          'mr',
+          'bn',
+        ]);
+        const language: ReminderLanguage = allowedReminderLangs.has(body.language)
+          ? (body.language as ReminderLanguage)
+          : allowedReminderLangs.has(store.language)
+          ? (store.language as ReminderLanguage)
+          : 'en';
+
+        const generated = await generateSmartReminderMessage({
+          customerName: customer.name,
+          shopName: store.store_name,
+          amount: amountDue,
+          language,
+          daysOverdue: statement?.summary.daysSinceLastPayment,
+          useAiPolish: body.useAiPolish === true,
+        });
+
+        res.json({
+          customerId: customer.id,
+          customerName: customer.name,
+          phone: customer.phone,
+          amountDue,
+          language,
+          message: generated.message,
+          generatedBy: generated.generatedBy,
+          remindersOptIn: Boolean(customer.reminders_opt_in),
+        });
+      } catch (err) {
+        console.error('Reminder generate error:', err);
+        res.status(500).json({ error: 'Could not generate reminder message.' });
+      }
+    }
+  );
+
+  app.post('/api/reminders', requireAuth, (req: AuthenticatedRequest, res) => {
+    const { userId, storeId } = req.auth!;
+    const body = req.body ?? {};
+    const customerId =
+      typeof body.customerId === 'string' ? body.customerId.trim() : '';
+    const message =
+      typeof body.message === 'string' ? body.message.trim().slice(0, 800) : '';
+    const language =
+      typeof body.language === 'string' ? body.language.trim().slice(0, 16) : 'en';
+    const channel =
+      body.channel === 'sms' || body.channel === 'copy' ? body.channel : 'whatsapp';
+    const status: PaymentReminderRow['status'] =
+      body.status === 'opened_whatsapp' ||
+      body.status === 'marked_sent' ||
+      body.status === 'customer_responded'
+        ? body.status
+        : 'marked_sent';
+
+    if (!customerId || !message) {
+      res.status(400).json({ error: 'Customer and reminder message are required.' });
+      return;
+    }
+
+    const customer = db
+      .prepare('SELECT * FROM customers WHERE id = ? AND store_id = ?')
+      .get(customerId, storeId) as CustomerRow | undefined;
+    if (!customer) {
+      res.status(404).json({ error: 'Customer not found.' });
+      return;
+    }
+
+    const statement = computeCustomerStatement(db, storeId, customerId);
+    const amountDue = Math.max(0, statement?.summary.outstanding ?? 0);
+    const nowIso = new Date().toISOString();
+    const id = `rem-${storeId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const sentAt = status === 'marked_sent' || status === 'opened_whatsapp' ? nowIso : null;
+
+    const tx = db.transaction(() => {
+      db.prepare(
+        `INSERT INTO payment_reminders (id, store_id, customer_id, customer_name, amount_due, language, message, channel, status, customer_response, created_at, sent_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
+      ).run(
+        id,
+        storeId,
+        customer.id,
+        customer.name,
+        amountDue,
+        language,
+        message,
+        channel,
+        status,
+        nowIso,
+        sentAt
+      );
+
+      writeAuditLog(db, {
+        storeId,
+        userId,
+        action: 'reminder_logged',
+        entityType: 'payment_reminder',
+        entityId: id,
+        after: { customerId: customer.id, amountDue, channel, status },
+      });
+    });
+    tx();
+
+    const row = db
+      .prepare('SELECT * FROM payment_reminders WHERE id = ?')
+      .get(id) as PaymentReminderRow;
+
+    res.status(201).json({
+      reminder: {
+        id: row.id,
+        customerId: row.customer_id,
+        customerName: row.customer_name,
+        amountDue: row.amount_due,
+        language: row.language,
+        message: row.message,
+        channel: row.channel,
+        status: row.status,
+        customerResponse: row.customer_response ?? undefined,
+        createdAt: row.created_at,
+        sentAt: row.sent_at ?? undefined,
+      },
+    });
+  });
+
+  app.patch('/api/reminders/:id', requireAuth, (req: AuthenticatedRequest, res) => {
+    const { userId, storeId } = req.auth!;
+    const reminderId = req.params.id;
+    const current = db
+      .prepare('SELECT * FROM payment_reminders WHERE id = ? AND store_id = ?')
+      .get(reminderId, storeId) as PaymentReminderRow | undefined;
+
+    if (!current) {
+      res.status(404).json({ error: 'Reminder record not found.' });
+      return;
+    }
+
+    const body = req.body ?? {};
+    const customerResponse =
+      body.customerResponse !== undefined
+        ? typeof body.customerResponse === 'string' && body.customerResponse.trim()
+          ? body.customerResponse.trim().slice(0, 300)
+          : null
+        : current.customer_response;
+    const status: PaymentReminderRow['status'] =
+      body.status === 'draft' ||
+      body.status === 'opened_whatsapp' ||
+      body.status === 'marked_sent' ||
+      body.status === 'customer_responded'
+        ? body.status
+        : customerResponse
+        ? 'customer_responded'
+        : current.status;
+    const sentAt =
+      current.sent_at ??
+      (status === 'marked_sent' || status === 'customer_responded'
+        ? new Date().toISOString()
+        : null);
+
+    db.prepare(
+      'UPDATE payment_reminders SET status = ?, customer_response = ?, sent_at = ? WHERE id = ? AND store_id = ?'
+    ).run(status, customerResponse, sentAt, reminderId, storeId);
+
+    writeAuditLog(db, {
+      storeId,
+      userId,
+      action: 'reminder_updated',
+      entityType: 'payment_reminder',
+      entityId: reminderId,
+      before: { status: current.status, customerResponse: current.customer_response },
+      after: { status, customerResponse },
+    });
+
+    const updated = db
+      .prepare('SELECT * FROM payment_reminders WHERE id = ?')
+      .get(reminderId) as PaymentReminderRow;
+
+    res.json({
+      reminder: {
+        id: updated.id,
+        customerId: updated.customer_id,
+        customerName: updated.customer_name,
+        amountDue: updated.amount_due,
+        language: updated.language,
+        message: updated.message,
+        channel: updated.channel,
+        status: updated.status,
+        customerResponse: updated.customer_response ?? undefined,
+        createdAt: updated.created_at,
+        sentAt: updated.sent_at ?? undefined,
+      },
+    });
+  });
+
+  // =========================================================================
   // VOICE PIPELINE ROUTES (Gnani STT/TTS + Server-side Gemini Intent)
   // =========================================================================
 
@@ -1018,6 +1737,8 @@ export function createApiApp(db: Database.Database): express.Express {
           language,
           hasPendingConfirmation,
           customerNames: customerRows.map((c) => c.name),
+          clientDate:
+            typeof body.clientDate === 'string' ? body.clientDate : undefined,
         });
 
         res.json({

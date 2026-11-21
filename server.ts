@@ -11,8 +11,10 @@ import {
   extractVoiceIntent,
   getVerifiedVoicePipelineStatus,
   openGnaniSttStream,
+  streamSynthesizeWithGnani,
   transcribeWithGnani,
   type GnaniStreamHandle,
+  type GnaniTtsStreamHandle,
 } from './server/voicePipeline.ts';
 import type { LanguageCode } from './src/types/khata.ts';
 
@@ -92,13 +94,47 @@ async function startServer() {
       let hasPendingConfirmation = false;
       let audioChunks: Buffer[] = [];
       let gnaniStream: GnaniStreamHandle | null = null;
+      let activeTtsStream: GnaniTtsStreamHandle | null = null;
+      let activeTtsRequestId: string | null = null;
       let streamFinalText = '';
       let streamFinalLang: string | undefined;
+      let streamFinalLatencyMs: number | undefined;
+      let turnDispatched = false;
+      let isAlive = true;
+
+      // 25s protocol-level heartbeat keeps reverse-proxy WebSockets alive across idle periods
+      ws.on('pong', () => {
+        isAlive = true;
+      });
+      const heartbeat = setInterval(() => {
+        if (ws.readyState !== WebSocket.OPEN) {
+          clearInterval(heartbeat);
+          return;
+        }
+        if (!isAlive) {
+          try {
+            ws.terminate();
+          } catch {
+            // ignore
+          }
+          clearInterval(heartbeat);
+          return;
+        }
+        isAlive = false;
+        try {
+          ws.ping();
+        } catch {
+          // ignore
+        }
+      }, 25_000);
 
       void getVerifiedVoicePipelineStatus().then((pipelineStatus) => {
         sendWsJson(ws, {
           type: 'stt_ready',
           provider: pipelineStatus.sttProvider,
+          ttsProvider: pipelineStatus.ttsProvider,
+          gnaniAuthState: pipelineStatus.gnaniAuthState,
+          gnaniError: pipelineStatus.gnaniError,
         });
       });
 
@@ -107,6 +143,14 @@ async function startServer() {
           gnaniStream.close();
           gnaniStream = null;
         }
+      };
+
+      const cancelActiveTts = () => {
+        if (activeTtsStream) {
+          activeTtsStream.cancel();
+          activeTtsStream = null;
+        }
+        activeTtsRequestId = null;
       };
 
       const dispatchTranscriptOutcome = async (transcript: string) => {
@@ -165,7 +209,9 @@ async function startServer() {
       };
 
       ws.on('message', async (data, isBinary) => {
+        isAlive = true;
         if (isBinary) {
+          if (turnDispatched) return;
           const buf = Buffer.isBuffer(data)
             ? data
             : Buffer.from(data as ArrayBuffer);
@@ -182,9 +228,90 @@ async function startServer() {
             language?: LanguageCode;
             hasPendingConfirmation?: boolean;
             text?: string;
+            requestId?: string;
+            ts?: number;
           };
 
+          if (msg.type === 'ping') {
+            sendWsJson(ws, { type: 'pong', ts: msg.ts ?? Date.now() });
+            return;
+          }
+
+          if (msg.type === 'update_language' && msg.language) {
+            sessionLang = msg.language;
+            gnaniStream?.updateSettings(sessionLang);
+            return;
+          }
+
+          if (msg.type === 'tts_cancel') {
+            if (!msg.requestId || msg.requestId === activeTtsRequestId) {
+              cancelActiveTts();
+            }
+            return;
+          }
+
+          if (msg.type === 'tts_request' && typeof msg.text === 'string') {
+            const requestId =
+              typeof msg.requestId === 'string' && msg.requestId.trim()
+                ? msg.requestId.trim()
+                : `tts-${Date.now()}`;
+            const ttsLang = msg.language || sessionLang;
+
+            cancelActiveTts();
+            activeTtsRequestId = requestId;
+
+            activeTtsStream = streamSynthesizeWithGnani({
+              text: msg.text,
+              language: ttsLang,
+              onStart: ({ sampleRate }) => {
+                if (activeTtsRequestId !== requestId) return;
+                sendWsJson(ws, {
+                  type: 'agent_audio_start',
+                  requestId,
+                  sampleRate,
+                  format: 'pcm16',
+                });
+              },
+              onChunk: ({ chunkIndex, audioBase64, sampleRate }) => {
+                if (activeTtsRequestId !== requestId) return;
+                sendWsJson(ws, {
+                  type: 'agent_audio_chunk',
+                  requestId,
+                  chunkIndex,
+                  audioBase64,
+                  sampleRate,
+                });
+              },
+              onComplete: ({ firstChunkLatencyMs, totalLatencyMs }) => {
+                if (activeTtsRequestId !== requestId) return;
+                activeTtsStream = null;
+                activeTtsRequestId = null;
+                sendWsJson(ws, {
+                  type: 'agent_audio_end',
+                  requestId,
+                  firstChunkLatencyMs,
+                  totalLatencyMs,
+                });
+              },
+              onError: (errMsg, code) => {
+                if (activeTtsRequestId !== requestId) return;
+                activeTtsStream = null;
+                activeTtsRequestId = null;
+                sendWsJson(ws, {
+                  type: 'agent_audio_error',
+                  requestId,
+                  code,
+                  error: errMsg,
+                });
+              },
+            });
+            return;
+          }
+
           if (msg.type === 'session_start' || msg.type === 'audio_start') {
+            // Server-side barge-in: immediately abort any active Timbre TTS stream
+            cancelActiveTts();
+
             if (msg.language) sessionLang = msg.language;
             if (typeof msg.hasPendingConfirmation === 'boolean') {
               hasPendingConfirmation = msg.hasPendingConfirmation;
@@ -192,19 +319,51 @@ async function startServer() {
             audioChunks = [];
             streamFinalText = '';
             streamFinalLang = undefined;
+            streamFinalLatencyMs = undefined;
+            turnDispatched = false;
             closeGnaniStream();
 
             // Open live upstream Gnani Prisma v3.0 WebSocket stream when credentials exist
             gnaniStream = openGnaniSttStream({
               language: sessionLang,
-              onPartial: (partial) => {
-                sendWsJson(ws, { type: 'transcript_partial', text: partial });
+              onVadState: (state) => {
+                if (!turnDispatched) {
+                  sendWsJson(ws, { type: 'vad_state', state });
+                }
               },
-              onFinal: (finalText, detectedLang) => {
+              onPartial: (partial) => {
+                if (!turnDispatched) {
+                  sendWsJson(ws, {
+                    type: 'transcript_partial',
+                    text: partial,
+                    stableText: streamFinalText || undefined,
+                  });
+                }
+              },
+              onFinal: (finalText, detectedLang, latencyMs) => {
+                if (turnDispatched) return;
                 streamFinalText = streamFinalText
                   ? `${streamFinalText} ${finalText}`
                   : finalText;
                 streamFinalLang = detectedLang;
+                streamFinalLatencyMs = latencyMs;
+
+                const cleanFinal = streamFinalText.trim();
+                if (!cleanFinal) return;
+
+                // Prisma server-side VAD finalized the utterance: dispatch immediately for lowest latency
+                turnDispatched = true;
+                audioChunks = [];
+                closeGnaniStream();
+
+                sendWsJson(ws, {
+                  type: 'transcript_final',
+                  text: cleanFinal,
+                  detectedLanguage: streamFinalLang,
+                  latencyMs: streamFinalLatencyMs,
+                  autoEndpointed: true,
+                });
+                void dispatchTranscriptOutcome(cleanFinal);
               },
               onError: (errMsg, code) => {
                 if (code === 'GNANI_AUTH_FAILED') {
@@ -224,11 +383,15 @@ async function startServer() {
           if (msg.type === 'audio_cancel') {
             audioChunks = [];
             streamFinalText = '';
+            streamFinalLang = undefined;
+            streamFinalLatencyMs = undefined;
+            turnDispatched = false;
             closeGnaniStream();
             return;
           }
 
           if (msg.type === 'text_input' && typeof msg.text === 'string') {
+            cancelActiveTts();
             if (typeof msg.hasPendingConfirmation === 'boolean') {
               hasPendingConfirmation = msg.hasPendingConfirmation;
             }
@@ -240,12 +403,25 @@ async function startServer() {
             if (typeof msg.hasPendingConfirmation === 'boolean') {
               hasPendingConfirmation = msg.hasPendingConfirmation;
             }
+
+            // If Prisma already finalized & dispatched this turn via server-side VAD, do not duplicate
+            if (turnDispatched) {
+              audioChunks = [];
+              closeGnaniStream();
+              return;
+            }
+
             const combined = Buffer.concat(audioChunks);
             audioChunks = [];
 
             if (gnaniStream) {
               await gnaniStream.finish();
               closeGnaniStream();
+            }
+
+            // Check again in case onFinal fired during gnaniStream.finish() flush
+            if (turnDispatched) {
+              return;
             }
 
             if (combined.byteLength === 0 && !streamFinalText) {
@@ -280,10 +456,13 @@ async function startServer() {
               detectedLanguage = stt.detectedLanguage;
             }
 
+            turnDispatched = true;
             sendWsJson(ws, {
               type: 'transcript_final',
               text: finalTranscript,
               detectedLanguage,
+              latencyMs: streamFinalLatencyMs,
+              autoEndpointed: false,
             });
 
             await dispatchTranscriptOutcome(finalTranscript);
@@ -294,7 +473,9 @@ async function startServer() {
       });
 
       ws.on('close', () => {
+        clearInterval(heartbeat);
         audioChunks = [];
+        cancelActiveTts();
         closeGnaniStream();
       });
     });

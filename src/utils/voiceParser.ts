@@ -22,6 +22,13 @@ export type VoiceParseOutcome =
       customerName?: string;
     }
   | {
+      kind: 'reverse_last_entry';
+      customerName?: string;
+      direction?: EntryDirection;
+      replacementAmount?: number;
+      reason: string;
+    }
+  | {
       kind: 'query_today_summary';
     }
   | {
@@ -77,6 +84,12 @@ const PAYMENT_KEYWORDS = [
   'kottiddare',
   'pavati',
   'bandide',
+  'back',
+  'returned',
+  'return',
+  'settled',
+  'cleared',
+  'deposited',
 ];
 
 const CREDIT_KEYWORDS = [
@@ -116,6 +129,11 @@ const CREDIT_KEYWORDS = [
   'bareyiri',
   'tagondru',
   'tagondaru',
+  'taken',
+  'borrowed',
+  'borrow',
+  'due',
+  'pending',
 ];
 
 const CORRECTION_PREFIXES = [
@@ -426,6 +444,70 @@ const FILLER_WORDS = new Set([
   'ivattu',
   'indina',
   'ninne',
+  // Common English/Hinglish verbs, pronouns, prepositions, and payment nouns that must never pollute customer names
+  'has',
+  'have',
+  'had',
+  'is',
+  'was',
+  'are',
+  'were',
+  'been',
+  'be',
+  'will',
+  'would',
+  'did',
+  'he',
+  'she',
+  'his',
+  'her',
+  'him',
+  'they',
+  'them',
+  'their',
+  'my',
+  'our',
+  'a',
+  'an',
+  'in',
+  'on',
+  'at',
+  'by',
+  'with',
+  'about',
+  'just',
+  'now',
+  'already',
+  'again',
+  'given',
+  'give',
+  'take',
+  'taken',
+  'bought',
+  'purchased',
+  'sent',
+  'amount',
+  'money',
+  'cash',
+  'upi',
+  'online',
+  'please',
+  'pls',
+  'sir',
+  'madam',
+  'mr',
+  'mrs',
+  'ms',
+  'customer',
+  'person',
+  'account',
+  'khata',
+  'balance',
+  'record',
+  'put',
+  'write',
+  'note',
+  'save',
   ...Object.keys(NUMBER_UNITS),
   ...Object.keys(MULTIPLIER_WORDS),
   ...PAYMENT_KEYWORDS,
@@ -644,6 +726,60 @@ export function parseVoiceUtterance(
     }
   }
 
+  // 2.5 Check committed-entry cancellation / reversal when no confirmation sheet is open
+  // e.g. "Last transaction cancel karo", "Ramesh ka pichla payment galat tha", "Undo last entry"
+  if (!options.hasPendingConfirmation) {
+    const isReversalRequest =
+      /\b(?:last\s+(?:transaction|entry)|pichla|pichli|pichle|previous\s+(?:transaction|entry|payment|credit))\b/i.test(
+        lower
+      ) &&
+      /\b(?:cancel|undo|reverse|galat|wrong|mistake|hatao|delete|cancel\s+karo)\b/i.test(
+        lower
+      );
+
+    if (isReversalRequest) {
+      let direction: EntryDirection | undefined;
+      if (PAYMENT_KEYWORDS.some((kw) => lower.includes(kw))) {
+        direction = 'payment';
+      } else if (CREDIT_KEYWORDS.some((kw) => lower.includes(kw))) {
+        direction = 'credit';
+      }
+      const cleanedNameTokens = trimmed
+        .replace(/[₹.,!?]/g, ' ')
+        .split(/\s+/)
+        .filter(Boolean)
+        .filter((tok) => !/^\d+$/.test(tok))
+        .filter(
+          (tok) =>
+            !FILLER_WORDS.has(tok.toLowerCase()) &&
+            !/^(?:last|transaction|entry|cancel|karo|undo|reverse|pichla|pichli|pichle|previous|galat|tha|thi|wrong|mistake|hatao|delete|make|it|instead|nahi)$/i.test(
+              tok
+            )
+        );
+      const customerName =
+        cleanedNameTokens.length > 0
+          ? cleanedNameTokens
+              .slice(0, 2)
+              .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+              .join(' ')
+          : undefined;
+
+      const allDigits = [...trimmed.replace(/(\d),(\d)/g, '$1$2').matchAll(/\b(\d{1,7})\b/g)].map(
+        (m) => Number(m[1])
+      );
+      const replacementAmount =
+        allDigits.length > 0 ? allDigits[allDigits.length - 1] : undefined;
+
+      return {
+        kind: 'reverse_last_entry',
+        customerName,
+        direction,
+        replacementAmount,
+        reason: trimmed,
+      };
+    }
+  }
+
   const amount = extractAmount(trimmed);
 
   // 3. Check live spoken correction if confirmation sheet is currently open
@@ -662,9 +798,17 @@ export function parseVoiceUtterance(
       } else if (CREDIT_KEYWORDS.some((kw) => lower.includes(kw))) {
         direction = 'credit';
       }
+      // For phrases like "nahi, 500 nahi, 450 rupaye likho", prefer the final mentioned amount
+      const allDigits = [...trimmed.replace(/(\d),(\d)/g, '$1$2').matchAll(/\b(\d{1,7})\b/g)].map(
+        (m) => Number(m[1])
+      );
+      const correctedAmount =
+        allDigits.length > 1
+          ? allDigits[allDigits.length - 1]
+          : amount ?? undefined;
       return {
         kind: 'correction',
-        amount: amount ?? undefined,
+        amount: correctedAmount,
         direction,
       };
     }
@@ -785,10 +929,83 @@ function toPhoneticSearchKey(input: string): string {
 }
 
 /**
+ * Collapses common Indian-English STT phonetic spelling variations (e.g. "Mallikaajan" ~ "Mallikarjun",
+ * "Malik Arjun" ~ "Mallikarjun", "Rames" ~ "Ramesh") into a compact comparison key.
+ */
+function toFuzzyPhoneticCompact(input: string): string {
+  return toPhoneticSearchKey(input)
+    .replace(/[^a-z0-9]/g, '')
+    .replace(/(.)\1+/g, '$1')
+    .replace(/ee|ea|iy/g, 'i')
+    .replace(/oo|ou/g, 'u')
+    .replace(/ph/g, 'f')
+    .replace(/sh/g, 's')
+    .replace(/th/g, 't')
+    .replace(/dh/g, 'd')
+    .replace(/bh/g, 'b')
+    .replace(/kh/g, 'k')
+    .replace(/gh/g, 'g')
+    .replace(/v/g, 'w');
+}
+
+function levenshteinDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+
+  const prev = new Array<number>(b.length + 1);
+  const curr = new Array<number>(b.length + 1);
+  for (let j = 0; j <= b.length; j++) prev[j] = j;
+
+  for (let i = 1; i <= a.length; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+    }
+    for (let j = 0; j <= b.length; j++) prev[j] = curr[j];
+  }
+  return prev[b.length];
+}
+
+function isFuzzyNameMatch(needleRaw: string, candidateRaw: string): { matched: boolean; score: number } {
+  const nCompact = toFuzzyPhoneticCompact(needleRaw);
+  const cCompact = toFuzzyPhoneticCompact(candidateRaw);
+  if (nCompact.length < 4 || cCompact.length < 4) {
+    return { matched: false, score: 0 };
+  }
+  if (nCompact === cCompact) {
+    return { matched: true, score: 1 };
+  }
+
+  // Compare full compact forms AND first-word compact forms (handles "Mallikarjun" vs "Mallikarjun Rao" / "Mallikaajan")
+  const pairs: Array<[string, string]> = [[nCompact, cCompact]];
+  const nFirst = toFuzzyPhoneticCompact(needleRaw.split(/\s+/)[0] ?? '');
+  const cFirst = toFuzzyPhoneticCompact(candidateRaw.split(/\s+/)[0] ?? '');
+  if (nFirst.length >= 4 && cFirst.length >= 4) {
+    pairs.push([nFirst, cFirst]);
+    pairs.push([nFirst, cCompact]);
+    pairs.push([nCompact, cFirst]);
+  }
+
+  let bestScore = 0;
+  for (const [a, b] of pairs) {
+    const maxLen = Math.max(a.length, b.length);
+    const dist = levenshteinDistance(a, b);
+    const sim = 1 - dist / maxLen;
+    if (sim > bestScore) {
+      bestScore = sim;
+    }
+  }
+
+  return { matched: bestScore >= 0.72, score: bestScore };
+}
+
+/**
  * Matches a spoken customer name against stored customers.
- * Supports Latin, Devanagari, and Kannada phonetic matching so "रमेश" and "ರಮೇಶ್" match "Ramesh".
- * Returns exact/prefix/substring matches so duplicate names like two "Ramesh"es
- * trigger the disambiguation sheet cleanly.
+ * Supports Latin, Devanagari, and Kannada phonetic matching so "रमेश" and "ರಮೇಶ್" match "Ramesh",
+ * plus phonetic fuzzy matching so STT spelling variations like "Mallikaajan" match "Mallikarjun".
+ * Returns exact/prefix/substring/fuzzy matches so duplicate names trigger the disambiguation sheet cleanly.
  */
 export function findMatchingCustomers(
   spokenName: string,
@@ -800,7 +1017,7 @@ export function findMatchingCustomers(
   const phoneticNeedle = toPhoneticSearchKey(safeName);
   if (!needle) return [];
 
-  const matches = customers.filter((c) => {
+  const exactMatches = customers.filter((c) => {
     const full = (c.name ?? '').toLowerCase();
     const first = full.split(/\s+/)[0] ?? '';
     const phoneticFull = toPhoneticSearchKey(c.name ?? '');
@@ -814,6 +1031,17 @@ export function findMatchingCustomers(
       phoneticFull.includes(phoneticNeedle)
     );
   });
+
+  // If no exact/substring match, fall back to phonetic Levenshtein fuzzy matching
+  // (e.g. STT heard "Mallikaajan" or "Malik Arjun" for existing customer "Mallikarjun")
+  let matches = exactMatches;
+  if (matches.length === 0) {
+    const scored = customers
+      .map((c) => ({ customer: c, ...isFuzzyNameMatch(safeName, c.name ?? '') }))
+      .filter((item) => item.matched)
+      .sort((a, b) => b.score - a.score);
+    matches = scored.map((s) => s.customer);
+  }
 
   const sortedEntries = [...entries].sort((a, b) =>
     b.createdAt.localeCompare(a.createdAt)

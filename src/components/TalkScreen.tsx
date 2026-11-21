@@ -26,6 +26,7 @@ import {
   resolveVoiceWsUrl,
   speakConfirmation,
   stopSpeaking,
+  StreamingAudioPlayer,
   VoiceWsClient,
 } from '../utils/voiceClient';
 import { ConfirmationSheet } from './ConfirmationSheet';
@@ -40,6 +41,10 @@ interface TalkScreenProps {
   totals: DashboardTotals;
   t: TranslationStrings;
   onConfirmEntry: (pending: PendingConfirmation) => Promise<void> | void;
+  onReverseEntry?: (
+    entryId: string,
+    payload: { reason: string; replacementAmount?: number }
+  ) => Promise<void>;
   onMarkDisclosurePlayed: () => void;
   onEnableDemoMode: () => void;
   onClose: () => void;
@@ -65,9 +70,9 @@ function formatTimer(ms: number): string {
  * Screen 2: Talk (Voice Session)
  * - Genuine microphone capture via getUserMedia + AudioContext AnalyserNode + 16kHz PCM16 / WAV
  * - Real-time WebSocket streaming over /ws/voice -> Gnani Prisma v3.0 STT + Gemini Intent Extraction
- * - Automatic silence endpointing + manual Stop + Barge-in (tap mic interrupts playback immediately)
- * - Gnani Timbre v3.0 spoken confirmations with deduplication
- * - Transparently reports missing GNANI_API_KEY (never fabricates live STT)
+ * - Real-time Gnani Timbre v3.0 WebSocket TTS streaming played progressively on chunk #1
+ * - Server-side Prisma VAD auto-endpointing + manual Stop + instant full-duplex Barge-in
+ * - Transparently reports missing/invalid GNANI_API_KEY (never fabricates live STT)
  */
 export const TalkScreen: React.FC<TalkScreenProps> = ({
   settings,
@@ -76,6 +81,7 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
   totals,
   t,
   onConfirmEntry,
+  onReverseEntry,
   onMarkDisclosurePlayed,
   onEnableDemoMode,
   onClose,
@@ -85,55 +91,134 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
   const [waveformBars, setWaveformBars] = useState<number[]>(() => [...IDLE_BARS]);
   const [recordingMs, setRecordingMs] = useState(0);
   const [isRecording, setIsRecording] = useState(false);
+  const [vadSpeechActive, setVadSpeechActive] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatusResponse | null>(null);
-  const [transcriptWords, setTranscriptWords] = useState<string[]>([]);
+  const [finalTranscript, setFinalTranscript] = useState('');
+  const [partialTranscript, setPartialTranscript] = useState('');
   const [agentReply, setAgentReply] = useState<string>('');
   const [micError, setMicError] = useState<string | null>(null);
   const [showKeyboard, setShowKeyboard] = useState(false);
   const [typedInput, setTypedInput] = useState('');
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirmation | null>(null);
+  const [pendingReversal, setPendingReversal] = useState<{
+    entry: LedgerEntry;
+    reason: string;
+    replacementAmount?: number;
+  } | null>(null);
   const [disambiguation, setDisambiguation] = useState<DisambiguationState | null>(null);
   const [demoStepIdx, setDemoStepIdx] = useState(0);
 
   const isListeningRef = useRef(false);
   const isStartingRef = useRef(false);
   const wsStreamingActiveRef = useRef(false);
+  const wsSttReadyRef = useRef(false);
+  const wsTtsReadyRef = useRef(false);
+  const disclosureFiredRef = useRef(false);
   const pendingConfirmRef = useRef<PendingConfirmation | null>(null);
   const pointerDownTimeRef = useRef<number>(0);
   const wsClientRef = useRef<VoiceWsClient | null>(null);
+  const streamingPlayerRef = useRef<StreamingAudioPlayer | null>(null);
+  const pendingTtsMetaRef = useRef<{
+    requestId: string;
+    text: string;
+    language: AppSettings['language'];
+  } | null>(null);
   const recorderRef = useRef<AudioRecorderSession>(new AudioRecorderSession());
   const streamTimerRef = useRef<number | null>(null);
   const recClockTimerRef = useRef<number | null>(null);
   const stopListeningRef = useRef<() => Promise<void>>(async () => {});
+  const initialLangRef = useRef(settings.language);
+  const latestLanguageRef = useRef(settings.language);
 
   pendingConfirmRef.current = pendingConfirm;
+  latestLanguageRef.current = settings.language;
 
   const targetWsUrl = resolveVoiceWsUrl(settings.voiceWsUrl);
 
+  const getStreamingPlayer = useCallback(() => {
+    if (!streamingPlayerRef.current) {
+      streamingPlayerRef.current = new StreamingAudioPlayer();
+    }
+    return streamingPlayerRef.current;
+  }, []);
+
+  const cancelAllTts = useCallback(() => {
+    const activeReqId = pendingTtsMetaRef.current?.requestId;
+    pendingTtsMetaRef.current = null;
+    streamingPlayerRef.current?.stop();
+    stopSpeaking();
+    wsClientRef.current?.cancelTts(activeReqId);
+  }, []);
+
   const speakAndAnimate = useCallback(
     (text: string) => {
-      if (isListeningRef.current) return;
-      setAgentReply(text);
+      const clean = text.trim();
+      if (!clean || isListeningRef.current) return;
+
+      cancelAllTts();
+      setAgentReply(clean);
       setOrbState('speaking');
+
+      const lang = latestLanguageRef.current;
+      // Primary path: Gnani Timbre v3.0 real-time WebSocket TTS streaming over /ws/voice
+      if (
+        !settings.demoMode &&
+        wsClientRef.current?.isConnected() &&
+        wsTtsReadyRef.current
+      ) {
+        const reqId = wsClientRef.current.requestTts(clean, lang);
+        if (reqId) {
+          pendingTtsMetaRef.current = { requestId: reqId, text: clean, language: lang };
+          getStreamingPlayer().beginStream(reqId, {
+            onStart: () => {
+              if (!isListeningRef.current) setOrbState('speaking');
+            },
+            onEnd: () => {
+              if (pendingTtsMetaRef.current?.requestId === reqId) {
+                pendingTtsMetaRef.current = null;
+              }
+              setOrbState((curr) => (curr === 'speaking' ? 'idle' : curr));
+            },
+          });
+          return;
+        }
+      }
+
+      // Fallback path (offline / demo mode / WS disconnected): REST TTS -> browser speech
       void speakConfirmation(
-        text,
-        settings.language,
+        clean,
+        lang,
         () => {
           if (!isListeningRef.current) setOrbState('speaking');
         },
         () => setOrbState((curr) => (curr === 'speaking' ? 'idle' : curr))
       );
     },
-    [settings.language]
+    [cancelAllTts, getStreamingPlayer, settings.demoMode]
   );
+
+  const triggerInitialDisclosure = useCallback(() => {
+    if (disclosureFiredRef.current || settings.aiDisclosurePlayed) return;
+    disclosureFiredRef.current = true;
+    speakAndAnimate(t.aiDisclosureSpeech);
+    onMarkDisclosurePlayed();
+  }, [
+    onMarkDisclosurePlayed,
+    settings.aiDisclosurePlayed,
+    speakAndAnimate,
+    t.aiDisclosureSpeech,
+  ]);
 
   // Check backend Gnani/Gemini availability once when opening Talk screen
   useEffect(() => {
     let active = true;
     fetchVoiceStatusApi()
       .then((status) => {
-        if (active) setVoiceStatus(status);
+        if (!active) return;
+        wsSttReadyRef.current = Boolean(status.gnaniSttConfigured);
+        wsTtsReadyRef.current = Boolean(status.gnaniTtsConfigured);
+        setVoiceStatus(status);
       })
       .catch(() => {
         // Ignore if status check fails temporarily
@@ -143,21 +228,27 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
     };
   }, []);
 
-  // First voice session AI disclosure
+  // First voice session AI disclosure: wait briefly for /ws/voice stt_ready so greeting streams via Timbre WS
   useEffect(() => {
-    if (!settings.aiDisclosurePlayed) {
-      speakAndAnimate(t.aiDisclosureSpeech);
-      onMarkDisclosurePlayed();
-      const timer = window.setTimeout(() => {
-        setOrbState((curr) => (curr === 'speaking' ? 'idle' : curr));
-      }, 2800);
-      return () => window.clearTimeout(timer);
+    if (settings.aiDisclosurePlayed || disclosureFiredRef.current) return;
+    if (settings.demoMode || !targetWsUrl) {
+      triggerInitialDisclosure();
+      return;
     }
+    if (wsConnected && wsTtsReadyRef.current) {
+      triggerInitialDisclosure();
+      return;
+    }
+    const fallbackTimer = window.setTimeout(() => {
+      triggerInitialDisclosure();
+    }, 750);
+    return () => window.clearTimeout(fallbackTimer);
   }, [
     settings.aiDisclosurePlayed,
-    t.aiDisclosureSpeech,
-    onMarkDisclosurePlayed,
-    speakAndAnimate,
+    settings.demoMode,
+    targetWsUrl,
+    wsConnected,
+    triggerInitialDisclosure,
   ]);
 
   const handleParsedEntry = useCallback(
@@ -242,6 +333,37 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
         return;
       }
 
+      if (outcome.kind === 'reverse_last_entry') {
+        const activeEntries = [...entries]
+          .filter((e) => !e.undone)
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        const target = activeEntries.find((e) => {
+          const matchCust =
+            !outcome.customerName ||
+            e.customerName
+              .toLowerCase()
+              .includes(outcome.customerName.toLowerCase());
+          const matchDir = !outcome.direction || e.direction === outcome.direction;
+          return matchCust && matchDir;
+        });
+
+        if (!target) {
+          speakAndAnimate('No recent matching transaction found to reverse.');
+          setOrbState('idle');
+          return;
+        }
+
+        setPendingReversal({
+          entry: target,
+          reason: outcome.reason,
+          replacementAmount: outcome.replacementAmount,
+        });
+        speakAndAnimate(
+          `Found ₹${formatINRNumber(target.amount)} ${target.direction} for ${target.customerName}. Please confirm reversal on screen.`
+        );
+        return;
+      }
+
       if (outcome.kind === 'query_today_summary') {
         const reply = t.todaySummaryAnswer(
           formatINRNumber(totals.todayPayments),
@@ -273,6 +395,7 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
       setOrbState('idle');
     },
     [
+      entries,
       handleCustomerBalanceQuery,
       handleParsedEntry,
       speakAndAnimate,
@@ -288,8 +411,8 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
     async (text: string) => {
       const clean = text.trim();
       if (!clean) return;
-      const words = clean.split(/\s+/).filter(Boolean);
-      setTranscriptWords(words);
+      setFinalTranscript(clean);
+      setPartialTranscript('');
       setMicError(null);
       setOrbState('thinking');
 
@@ -328,7 +451,8 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
         window.clearInterval(streamTimerRef.current);
       }
       const words = phrase.trim().split(/\s+/);
-      setTranscriptWords([]);
+      setFinalTranscript('');
+      setPartialTranscript('');
       setAgentReply('');
       setMicError(null);
       setOrbState('listening');
@@ -337,7 +461,7 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
       let idx = 0;
       streamTimerRef.current = window.setInterval(() => {
         idx++;
-        setTranscriptWords(words.slice(0, idx));
+        setPartialTranscript(words.slice(0, idx).join(' '));
         setMicVolume(0.35 + (idx % 3) * 0.2);
         setWaveformBars(
           Array.from({ length: 12 }, (_, b) =>
@@ -359,20 +483,34 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
     [processUtteranceText]
   );
 
+  const stopRecordingClock = useCallback(() => {
+    if (recClockTimerRef.current) {
+      window.clearInterval(recClockTimerRef.current);
+      recClockTimerRef.current = null;
+    }
+  }, []);
+
   const wsHandlersRef = useRef({
     applyParseOutcome,
     handleParsedEntry,
     handleCustomerBalanceQuery,
     speakAndAnimate,
+    triggerInitialDisclosure,
+    stopRecordingClock,
+    getStreamingPlayer,
   });
   wsHandlersRef.current = {
     applyParseOutcome,
     handleParsedEntry,
     handleCustomerBalanceQuery,
     speakAndAnimate,
+    triggerInitialDisclosure,
+    stopRecordingClock,
+    getStreamingPlayer,
   };
 
-  // Connect authenticated same-origin /ws/voice WebSocket (or custom voiceWsUrl) automatically
+  // Connect authenticated same-origin /ws/voice WebSocket (or custom voiceWsUrl) automatically.
+  // Language changes are sent via `update_language` without tearing down the WebSocket!
   useEffect(() => {
     if (settings.demoMode || !targetWsUrl) {
       setWsConnected(false);
@@ -388,18 +526,109 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
       },
       onMessage: (msg: WsServerMessage) => {
         const handlers = wsHandlersRef.current;
+
         if (msg.type === 'stt_ready') {
+          const sttOk = msg.provider === 'gnani-prisma-v3';
+          const ttsOk = msg.ttsProvider === 'gnani-timbre-v3';
+          wsSttReadyRef.current = sttOk;
+          wsTtsReadyRef.current = ttsOk;
+          setVoiceStatus((prev) => ({
+            gnaniSttConfigured: sttOk,
+            gnaniTtsConfigured: ttsOk,
+            geminiConfigured: prev?.geminiConfigured ?? false,
+            sttProvider: msg.provider,
+            ttsProvider:
+              msg.ttsProvider ?? (ttsOk ? 'gnani-timbre-v3' : 'browser-fallback'),
+            intentProvider: prev?.intentProvider ?? 'local-parser',
+            missingCredentials: prev?.missingCredentials ?? [],
+            gnaniAuthState:
+              msg.gnaniAuthState ?? (sttOk ? 'connected' : 'unconfigured'),
+            gnaniError: msg.gnaniError,
+          }));
+          handlers.triggerInitialDisclosure();
           return;
         }
-        if (msg.type === 'transcript_partial' || msg.type === 'transcript_final') {
+
+        if (msg.type === 'vad_state') {
+          setVadSpeechActive(msg.state === 'speech_start');
+          return;
+        }
+
+        if (msg.type === 'agent_audio_start') {
+          // Stream already initialized in speakAndAnimate; ignore stale requestIds
+          return;
+        }
+
+        if (msg.type === 'agent_audio_chunk') {
+          if (pendingTtsMetaRef.current?.requestId === msg.requestId) {
+            handlers
+              .getStreamingPlayer()
+              .enqueueChunk(msg.requestId, msg.audioBase64, msg.sampleRate);
+          }
+          return;
+        }
+
+        if (msg.type === 'agent_audio_end') {
+          if (pendingTtsMetaRef.current?.requestId === msg.requestId) {
+            handlers.getStreamingPlayer().endStream(msg.requestId);
+          }
+          return;
+        }
+
+        if (msg.type === 'agent_audio_error') {
+          const meta = pendingTtsMetaRef.current;
+          if (meta && meta.requestId === msg.requestId) {
+            pendingTtsMetaRef.current = null;
+            streamingPlayerRef.current?.stop();
+            // Graceful fallback to REST Timbre / browser speech when WS TTS encounters an upstream error
+            void speakConfirmation(
+              meta.text,
+              meta.language,
+              () => {
+                if (!isListeningRef.current) setOrbState('speaking');
+              },
+              () => setOrbState((curr) => (curr === 'speaking' ? 'idle' : curr))
+            );
+          }
+          return;
+        }
+
+        if (msg.type === 'transcript_partial') {
+          const partial = typeof msg.text === 'string' ? msg.text.trim() : '';
+          if (typeof msg.stableText === 'string' && msg.stableText.trim()) {
+            setFinalTranscript(msg.stableText.trim());
+          }
+          if (partial) {
+            setPartialTranscript(partial);
+          }
+          return;
+        }
+
+        if (msg.type === 'transcript_final') {
           const text = typeof msg.text === 'string' ? msg.text.trim() : '';
+          setVadSpeechActive(false);
           if (text) {
-            setTranscriptWords(text.split(/\s+/).filter(Boolean));
+            setFinalTranscript(text);
+            setPartialTranscript('');
           }
-          if (msg.type === 'transcript_final') {
-            setOrbState('thinking');
+          // If Prisma server-side VAD auto-endpointed the turn, stop mic immediately without duplicate audio_end
+          if (
+            msg.autoEndpointed &&
+            (isListeningRef.current || recorderRef.current.isActive())
+          ) {
+            isListeningRef.current = false;
+            wsStreamingActiveRef.current = false;
+            setIsRecording(false);
+            handlers.stopRecordingClock();
+            setMicVolume(0);
+            setWaveformBars([...IDLE_BARS]);
+            recorderRef.current.cancel();
           }
-        } else if (msg.type === 'entry_parsed') {
+          setOrbState('thinking');
+          return;
+        }
+
+        if (msg.type === 'entry_parsed') {
           setOrbState('idle');
           setAgentReply('');
           handlers.handleParsedEntry({
@@ -447,6 +676,7 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
         } else if (msg.type === 'answer_text') {
           handlers.speakAndAnimate(msg.text);
         } else if (msg.type === 'voice_error') {
+          setVadSpeechActive(false);
           setOrbState('idle');
           setMicError(msg.error);
           if (
@@ -460,13 +690,18 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
     });
 
     wsClientRef.current = client;
-    client.connect(targetWsUrl, settings.language);
+    client.connect(targetWsUrl, initialLangRef.current);
 
     return () => {
       client.disconnect();
       wsClientRef.current = null;
     };
-  }, [settings.demoMode, targetWsUrl, settings.language]);
+  }, [settings.demoMode, targetWsUrl]);
+
+  // Propagate language changes mid-session over existing /ws/voice without reconnecting
+  useEffect(() => {
+    wsClientRef.current?.updateLanguage(settings.language);
+  }, [settings.language]);
 
   // Cleanup timers, active audio streams, and speech on unmount
   useEffect(() => {
@@ -479,16 +714,11 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
         window.clearInterval(recClockTimerRef.current);
       }
       recorder.cancel();
+      streamingPlayerRef.current?.dispose();
+      streamingPlayerRef.current = null;
       stopSpeaking();
     };
   }, []);
-
-  const stopRecordingClock = () => {
-    if (recClockTimerRef.current) {
-      window.clearInterval(recClockTimerRef.current);
-      recClockTimerRef.current = null;
-    }
-  };
 
   const stopListening = useCallback(async () => {
     if (!isListeningRef.current && !recorderRef.current.isActive()) {
@@ -496,6 +726,7 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
     }
     isListeningRef.current = false;
     setIsRecording(false);
+    setVadSpeechActive(false);
     stopRecordingClock();
     setMicVolume(0);
     setWaveformBars([...IDLE_BARS]);
@@ -534,7 +765,8 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
         setShowKeyboard(true);
         return;
       }
-      setTranscriptWords(transcriptText.split(/\s+/).filter(Boolean));
+      setFinalTranscript(transcriptText);
+      setPartialTranscript('');
       applyParseOutcome(res.outcome, transcriptText);
     } catch (err) {
       const apiErr = err as ApiError;
@@ -550,7 +782,7 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
         setShowKeyboard(true);
       }
     }
-  }, [applyParseOutcome, settings.language]);
+  }, [applyParseOutcome, settings.language, stopRecordingClock]);
 
   stopListeningRef.current = stopListening;
 
@@ -563,10 +795,11 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
       return;
     }
 
-    // Barge-in: stop any ongoing TTS playback immediately when shopkeeper taps mic
-    stopSpeaking();
+    // Full-duplex Barge-in: immediately stop local playback & cancel server Timbre WS stream
+    cancelAllTts();
     setMicError(null);
     setAgentReply('');
+    setVadSpeechActive(false);
 
     // Explicit Demo Mode (only when shopkeeper intentionally turned on Demo Mode)
     if (settings.demoMode) {
@@ -585,9 +818,10 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
       return;
     }
 
-    // Start live WebSocket stream if connected and Gnani STT is configured
+    // Start live WebSocket stream whenever /ws/voice is connected and Gnani STT is verified ready
     const canStreamWs = Boolean(
-      wsClientRef.current?.isConnected() && voiceStatus?.gnaniSttConfigured
+      wsClientRef.current?.isConnected() &&
+        (wsSttReadyRef.current || voiceStatus?.gnaniSttConfigured)
     );
     wsStreamingActiveRef.current = canStreamWs;
     if (canStreamWs && wsClientRef.current) {
@@ -618,6 +852,7 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
           wsClientRef.current.cancelAudioStream();
         }
         wsStreamingActiveRef.current = false;
+        setVadSpeechActive(false);
         setMicError(msg);
         setOrbState('idle');
         setIsRecording(false);
@@ -639,7 +874,8 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
     setIsRecording(true);
     setRecordingMs(0);
     setOrbState('listening');
-    setTranscriptWords([]);
+    setFinalTranscript('');
+    setPartialTranscript('');
 
     const recStart = Date.now();
     stopRecordingClock();
@@ -669,10 +905,12 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
     e.preventDefault();
     const text = typedInput.trim();
     if (!text) return;
+    cancelAllTts();
     setTypedInput('');
     setMicError(null);
     if (wsClientRef.current?.isConnected()) {
-      setTranscriptWords(text.split(/\s+/));
+      setFinalTranscript(text);
+      setPartialTranscript('');
       setOrbState('thinking');
       wsClientRef.current.sendTextTurn(text, Boolean(pendingConfirmRef.current));
     } else {
@@ -710,7 +948,7 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
       ? '#FF6B5E'
       : '#F59E0B';
 
-  const splitIdx = Math.max(1, Math.ceil(transcriptWords.length * 0.65));
+  const hasTranscript = Boolean(finalTranscript || partialTranscript);
 
   return (
     <div className="relative min-h-screen bg-[var(--khata-bg)] text-[var(--khata-text)] flex flex-col justify-between overflow-hidden">
@@ -752,6 +990,8 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
               <span>
                 {settings.demoMode
                   ? 'Demo Listening...'
+                  : vadSpeechActive
+                  ? `Speech detected · ${formatTimer(recordingMs)}`
                   : `Listening... ${formatTimer(recordingMs)}`}
               </span>
             </div>
@@ -774,21 +1014,21 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
           </div>
         )}
 
-        {/* Live Transcript + Agent Reply + Mic Error */}
+        {/* Live Transcript (true final vs partial distinction) + Agent Reply + Mic Error */}
         <div
           data-testid="live-transcript"
           aria-live="polite"
           className="mt-5 text-center min-h-[92px] flex flex-col items-center justify-center max-w-lg"
         >
-          {transcriptWords.length > 0 ? (
+          {hasTranscript ? (
             <p className="text-2xl sm:text-[26px] font-medium leading-snug tracking-tight">
-              <span className="text-[var(--khata-text)]">
-                {transcriptWords.slice(0, splitIdx).join(' ')}
-              </span>
-              {transcriptWords.length > splitIdx && (
+              {finalTranscript && (
+                <span className="text-[var(--khata-text)]">{finalTranscript}</span>
+              )}
+              {partialTranscript && (
                 <span className="text-[var(--khata-text-secondary)]">
-                  {' '}
-                  {transcriptWords.slice(splitIdx).join(' ')}
+                  {finalTranscript ? ' ' : ''}
+                  {partialTranscript}
                 </span>
               )}
             </p>
@@ -934,7 +1174,7 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
           type="button"
           onClick={() => {
             recorderRef.current.cancel();
-            stopSpeaking();
+            cancelAllTts();
             onClose();
           }}
           aria-label="Close voice session"
@@ -980,6 +1220,61 @@ export const TalkScreen: React.FC<TalkScreenProps> = ({
           }}
           onCancel={() => setPendingConfirm(null)}
         />
+      )}
+
+      {/* Auditable Voice Reversal Confirmation Sheet */}
+      {pendingReversal && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Confirm transaction reversal"
+          data-testid="voice-reversal-sheet"
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4"
+        >
+          <div className="w-full sm:max-w-md rounded-t-[24px] sm:rounded-[24px] bg-[var(--khata-surface)] border border-[var(--khata-border)] p-6 space-y-4 shadow-2xl animate-sheet-up">
+            <h2 className="text-lg font-bold">Confirm Auditable Reversal</h2>
+            <p className="text-sm text-[var(--khata-text-secondary)]">
+              Reverse{' '}
+              <strong className="text-[var(--khata-text)]">
+                {pendingReversal.entry.customerName}&apos;s ₹
+                {formatINRNumber(pendingReversal.entry.amount)}{' '}
+                {pendingReversal.entry.direction}
+              </strong>{' '}
+              from {pendingReversal.entry.date}?
+              {pendingReversal.replacementAmount
+                ? ` A replacement entry of ₹${formatINRNumber(pendingReversal.replacementAmount)} will be recorded.`
+                : ' The original record remains visible in your Audit Log.'}
+            </p>
+            <div className="flex items-center gap-2.5">
+              <button
+                type="button"
+                onClick={() => setPendingReversal(null)}
+                className="flex-1 min-h-[46px] rounded-full bg-[var(--khata-surface-elevated)] font-semibold text-sm"
+              >
+                {t.cancel}
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  const req = pendingReversal;
+                  setPendingReversal(null);
+                  if (onReverseEntry) {
+                    await onReverseEntry(req.entry.id, {
+                      reason: req.reason,
+                      replacementAmount: req.replacementAmount,
+                    });
+                    speakAndAnimate(
+                      `Reversed ₹${formatINRNumber(req.entry.amount)} for ${req.entry.customerName}.`
+                    );
+                  }
+                }}
+                className="flex-1 min-h-[46px] rounded-full bg-[#FF6B5E] text-[#0B0B0B] font-bold text-sm"
+              >
+                Confirm Reversal
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

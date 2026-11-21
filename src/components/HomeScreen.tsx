@@ -6,6 +6,7 @@ import {
   Bell,
   BookOpen,
   Menu,
+  MessageSquareText,
   Mic,
   MoreVertical,
   Pencil,
@@ -13,7 +14,6 @@ import {
   RotateCcw,
   Search,
   Trash2,
-  Users,
 } from 'lucide-react';
 import type {
   AppScreen,
@@ -109,7 +109,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
               onClick={() => onNavigate('settings')}
               aria-label={t.settings}
               data-testid="open-settings-btn"
-              className="min-h-[48px] min-w-[48px] w-12 h-12 rounded-full bg-[var(--khata-surface)] border border-[var(--khata-border)] flex items-center justify-center shrink-0 hover:opacity-90 active:scale-95 transition-transform"
+              className="lg:hidden min-h-[48px] min-w-[48px] w-12 h-12 rounded-full bg-[var(--khata-surface)] border border-[var(--khata-border)] flex items-center justify-center shrink-0 hover:opacity-90 active:scale-95 transition-transform"
             >
               <Menu className="w-5 h-5" />
             </button>
@@ -277,7 +277,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
               </div>
             </div>
 
-            {/* Quick Action Shortcuts: Add Udhaar, Record Payment, Customers, Reports */}
+            {/* Quick Action Shortcuts: Add Udhaar, Record Payment, AI Assistant, Reports */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
               <button
                 type="button"
@@ -303,12 +303,12 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
 
               <button
                 type="button"
-                onClick={() => onNavigate('ledger')}
-                data-testid="quick-customers-btn"
+                onClick={() => onNavigate('assistant')}
+                data-testid="quick-ai-assistant-btn"
                 className="min-h-[46px] px-3 rounded-full bg-[var(--khata-surface)] border border-[var(--khata-border)] text-xs sm:text-sm font-bold inline-flex items-center justify-center gap-1.5 hover:opacity-90"
               >
-                <Users className="w-4 h-4 shrink-0 text-[var(--khata-lavender)]" />
-                <span>Customers</span>
+                <MessageSquareText className="w-4 h-4 shrink-0 text-[var(--khata-lavender)]" />
+                <span>AI Chat</span>
               </button>
 
               <button

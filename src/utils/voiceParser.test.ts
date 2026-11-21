@@ -247,3 +247,53 @@ test('voiceParser handles undefined inputs defensively without throwing trim Typ
   const matches = findMatchingCustomers(undefined as unknown as string, seed.customers, seed.entries);
   assert.equal(matches.length, 0);
 });
+
+test('parseVoiceUtterance strips English verbs ("has taken", "has paid back") and findMatchingCustomers fuzzy-matches STT spelling drift', () => {
+  const creditRes = parseVoiceUtterance('Mallikarjun has taken 500 rupees credit');
+  assert.equal(creditRes.kind, 'entry');
+  if (creditRes.kind === 'entry') {
+    assert.equal(creditRes.pending.customerName, 'Mallikarjun');
+    assert.equal(creditRes.pending.amount, 500);
+    assert.equal(creditRes.pending.direction, 'credit');
+  }
+
+  const paymentRes = parseVoiceUtterance('Mallikaajan has paid back 100 rupees');
+  assert.equal(paymentRes.kind, 'entry');
+  if (paymentRes.kind === 'entry') {
+    assert.equal(paymentRes.pending.customerName, 'Mallikaajan');
+    assert.equal(paymentRes.pending.amount, 100);
+    assert.equal(paymentRes.pending.direction, 'payment');
+  }
+
+  const customers = [
+    {
+      id: 'c-malli',
+      name: 'Mallikarjun',
+      phone: '9845011111',
+      remindersOptIn: false,
+      createdAt: '2026-11-21T00:00:00.000Z',
+    },
+  ];
+  const entries = [
+    {
+      id: 'e-1',
+      customerId: 'c-malli',
+      customerName: 'Mallikarjun',
+      amount: 500,
+      direction: 'credit' as const,
+      date: '2026-11-21',
+      createdAt: '2026-11-21T10:00:00.000Z',
+    },
+  ];
+
+  // STT spelling drift "Mallikaajan" matches existing customer "Mallikarjun"
+  const fuzzy1 = findMatchingCustomers('Mallikaajan', customers, entries);
+  assert.equal(fuzzy1.length, 1);
+  assert.equal(fuzzy1[0].customerId, 'c-malli');
+  assert.equal(fuzzy1[0].balance, 500);
+
+  // Split spacing "Malik Arjun" also matches "Mallikarjun"
+  const fuzzy2 = findMatchingCustomers('Malik Arjun', customers, entries);
+  assert.equal(fuzzy2.length, 1);
+  assert.equal(fuzzy2[0].customerId, 'c-malli');
+});

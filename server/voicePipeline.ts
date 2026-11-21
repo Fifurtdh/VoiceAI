@@ -16,6 +16,7 @@ import { getTodayISO } from '../src/utils/format.ts';
 const DEFAULT_GNANI_STT_URL = 'https://api.vachana.ai/stt/v3';
 const DEFAULT_GNANI_STT_WS_URL = 'wss://api.vachana.ai/stt/v3/stream';
 const DEFAULT_GNANI_TTS_URL = 'https://api.vachana.ai/api/v1/tts/inference';
+const DEFAULT_GNANI_TTS_WS_URL = 'wss://api.vachana.ai/api/v1/tts';
 const DEFAULT_GNANI_TTS_VOICE = 'Shivani';
 
 export type GnaniAuthState =
@@ -60,6 +61,7 @@ function getGnaniAuthConfig(): {
   sttUrl: string;
   sttWsUrl: string;
   ttsUrl: string;
+  ttsWsUrl: string;
   ttsVoice: string;
 } {
   const apiKey = (process.env.GNANI_API_KEY || '').trim();
@@ -75,14 +77,15 @@ function getGnaniAuthConfig(): {
     sttUrl: (process.env.GNANI_STT_URL || DEFAULT_GNANI_STT_URL).trim(),
     sttWsUrl: (process.env.GNANI_STT_WS_URL || DEFAULT_GNANI_STT_WS_URL).trim(),
     ttsUrl: (process.env.GNANI_TTS_URL || DEFAULT_GNANI_TTS_URL).trim(),
+    ttsWsUrl: (process.env.GNANI_TTS_WS_URL || DEFAULT_GNANI_TTS_WS_URL).trim(),
     ttsVoice: (process.env.GNANI_TTS_VOICE || DEFAULT_GNANI_TTS_VOICE).trim(),
   };
 }
 
 export function getVoicePipelineStatus(): VoicePipelineStatus {
   const gnani = getGnaniAuthConfig();
-  const gnaniSttConfigured = Boolean(gnani.hasAuth && gnani.sttUrl);
-  const gnaniTtsConfigured = Boolean(gnani.hasAuth && gnani.ttsUrl);
+  const gnaniSttConfigured = Boolean(gnani.hasAuth && gnani.sttWsUrl);
+  const gnaniTtsConfigured = Boolean(gnani.hasAuth && (gnani.ttsWsUrl || gnani.ttsUrl));
   const geminiConfigured = Boolean(
     process.env.GEMINI_API_KEY &&
       process.env.GEMINI_API_KEY.trim() !== '' &&
@@ -368,13 +371,28 @@ function buildGnaniHeaders(): Record<string, string> {
 }
 
 /**
- * Resolves the Gnani Prisma v3.0 language_code parameter.
- * For non-English Indian shopkeepers, `indic-auto` automatically handles
- * code-mixed Hindi-English, Kannada-English, etc., while honoring explicit locale hints.
+ * Resolves the explicit BCP-47 locale for a Voice Khata language code.
  */
 export function resolveGnaniLanguageCode(language: LanguageCode): string {
   if (language === 'en') return 'en-IN';
   return getSpeechLang(language);
+}
+
+/**
+ * Resolves official Gnani Prisma v3.0 WebSocket streaming language + format parameters.
+ * - On default `'en'` (where Indian shopkeepers frequently speak Hinglish, Kanglish, or English),
+ *   uses `language_code: 'indic-auto'` + `format: 'codemix'` for seamless multilingual auto-detection.
+ * - On explicit regional language selection (`hi`, `kn`, `ta`, `te`, `mr`, `bn`),
+ *   locks to that locale (e.g. `kn-IN`, `hi-IN`) with `format: 'codemix'` for mixed Indic+English speech.
+ */
+export function resolveGnaniStreamConfig(language: LanguageCode): {
+  languageCode: string;
+  format: 'codemix';
+} {
+  return {
+    languageCode: language === 'en' ? 'indic-auto' : getSpeechLang(language),
+    format: 'codemix',
+  };
 }
 
 /**
@@ -473,7 +491,6 @@ export async function transcribeWithGnani(params: {
   }
 
   const fileMeta = inferAudioFileMeta(uploadMime);
-  const langCode = resolveGnaniLanguageCode(params.language);
 
   const form = new FormData();
   const audioBytes = new Uint8Array(
@@ -488,9 +505,10 @@ export async function transcribeWithGnani(params: {
     new Blob([copyBytes], { type: fileMeta.contentType }),
     fileMeta.filename
   );
+  const streamCfg = resolveGnaniStreamConfig(params.language);
   form.append('model', 'prisma-v3.0');
-  form.append('language_code', langCode);
-  form.append('format', 'transcribe');
+  form.append('language_code', streamCfg.languageCode);
+  form.append('format', streamCfg.format);
 
   try {
     const controller = new AbortController();
@@ -565,6 +583,7 @@ export async function transcribeWithGnani(params: {
 
 export interface GnaniStreamHandle {
   sendPcmChunk: (chunk: Buffer) => void;
+  updateSettings: (language: LanguageCode) => void;
   finish: () => Promise<void>;
   close: () => void;
   isOpen: () => boolean;
@@ -572,12 +591,15 @@ export interface GnaniStreamHandle {
 
 /**
  * Opens a real-time streaming WebSocket session to Gnani Prisma v3.0 (`wss://api.vachana.ai/stt/v3/stream`).
- * Passes authentication and audio format properties as WebSocket upgrade headers per official Gnani docs.
+ * Passes authentication and audio format properties as WebSocket upgrade headers per official Gnani docs,
+ * forwards server-side VAD events (`speech_start`/`speech_end`), partials, and final transcripts,
+ * and supports mid-session `update_settings` language changes.
  */
 export function openGnaniSttStream(params: {
   language: LanguageCode;
+  onVadState?: (state: 'speech_start' | 'speech_end') => void;
   onPartial: (text: string) => void;
-  onFinal: (text: string, detectedLanguage?: string) => void;
+  onFinal: (text: string, detectedLanguage?: string, latencyMs?: number) => void;
   onError: (errMsg: string, code?: 'GNANI_AUTH_FAILED' | 'GNANI_UPSTREAM_ERROR') => void;
 }): GnaniStreamHandle | null {
   const gnani = getGnaniAuthConfig();
@@ -585,15 +607,15 @@ export function openGnaniSttStream(params: {
     return null;
   }
 
-  const langCode = resolveGnaniLanguageCode(params.language);
+  const streamCfg = resolveGnaniStreamConfig(params.language);
   const headers: Record<string, string> = {
     ...buildGnaniHeaders(),
     model: 'prisma-v3.0',
-    language_code: langCode,
+    language_code: streamCfg.languageCode,
     encoding: 'linear_pcm',
     sample_rate: '16000',
     num_channels: '1',
-    format: 'transcribe',
+    format: streamCfg.format,
     partials_enabled: 'true',
   };
 
@@ -645,8 +667,14 @@ export function openGnaniSttStream(params: {
         is_final?: boolean;
         isFinal?: boolean;
         detected_language_code?: string;
+        latency?: number;
         error?: string;
       };
+
+      if (parsed.type === 'speech_start' || parsed.type === 'speech_end') {
+        params.onVadState?.(parsed.type);
+        return;
+      }
 
       if (parsed.error) {
         const lower = parsed.error.toLowerCase();
@@ -675,7 +703,11 @@ export function openGnaniSttStream(params: {
       );
       if (isFinal) {
         receivedFinal = true;
-        params.onFinal(text, parsed.detected_language_code);
+        params.onFinal(
+          text,
+          parsed.detected_language_code,
+          typeof parsed.latency === 'number' ? Math.round(parsed.latency) : undefined
+        );
         if (finishedResolve) {
           finishedResolve();
           finishedResolve = null;
@@ -731,12 +763,27 @@ export function openGnaniSttStream(params: {
         }
       }
     },
+    updateSettings(language: LanguageCode) {
+      if (closed || ws.readyState !== WebSocket.OPEN) return;
+      const nextCfg = resolveGnaniStreamConfig(language);
+      try {
+        ws.send(
+          JSON.stringify({
+            type: 'update_settings',
+            language_code: nextCfg.languageCode,
+            format: nextCfg.format,
+          })
+        );
+      } catch {
+        // ignore if socket closed concurrently
+      }
+    },
     async finish() {
       if (closed || receivedFinal) return;
       if (ws.readyState === WebSocket.OPEN) {
         // Flush short trailing silence frames so Gnani VAD closes the utterance cleanly
         const silenceFrame = Buffer.alloc(1024, 0);
-        for (let i = 0; i < 32; i++) {
+        for (let i = 0; i < 20; i++) {
           if (ws.readyState !== WebSocket.OPEN || receivedFinal) break;
           ws.send(silenceFrame);
         }
@@ -752,7 +799,7 @@ export function openGnaniSttStream(params: {
             finishedResolve();
             finishedResolve = null;
           }
-        }, 1200);
+        }, 1000);
       });
     },
     close() {
@@ -767,6 +814,314 @@ export function openGnaniSttStream(params: {
     isOpen() {
       return open && !closed;
     },
+  };
+}
+
+export interface GnaniTtsStreamHandle {
+  cancel: () => void;
+  done: Promise<void>;
+}
+
+/**
+ * Streams real-time Text-to-Speech audio chunks from Gnani Timbre v3.0 over WebSocket
+ * (`wss://api.vachana.ai/api/v1/tts`).
+ * Emits raw signed 16-bit LE mono PCM chunks @ 24kHz immediately as they arrive for low-latency TTFA,
+ * and supports instant barge-in cancellation via `cancel()`.
+ */
+export function streamSynthesizeWithGnani(params: {
+  text: string;
+  language: LanguageCode;
+  onStart?: (meta: { sampleRate: number }) => void;
+  onChunk: (chunk: {
+    chunkIndex: number;
+    audioBase64: string;
+    sampleRate: number;
+  }) => void;
+  onComplete?: (stats: {
+    chunkCount: number;
+    firstChunkLatencyMs?: number;
+    totalLatencyMs: number;
+  }) => void;
+  onError: (
+    errMsg: string,
+    code: 'GNANI_NOT_CONFIGURED' | 'GNANI_AUTH_FAILED' | 'GNANI_UPSTREAM_ERROR'
+  ) => void;
+}): GnaniTtsStreamHandle {
+  const gnani = getGnaniAuthConfig();
+  const sampleRate = 24000;
+  const cleanText = params.text.trim().slice(0, 500);
+
+  if (!gnani.hasAuth || !gnani.ttsWsUrl) {
+    params.onError(
+      'Gnani Timbre v3.0 TTS requires GNANI_API_KEY to be configured on the server.',
+      'GNANI_NOT_CONFIGURED'
+    );
+    return { cancel: () => {}, done: Promise.resolve() };
+  }
+
+  if (!cleanText) {
+    params.onComplete?.({ chunkCount: 0, totalLatencyMs: 0 });
+    return { cancel: () => {}, done: Promise.resolve() };
+  }
+
+  let cancelled = false;
+  let settled = false;
+  let ws: WebSocket | null = null;
+  let resolveDone!: () => void;
+  const done = new Promise<void>((resolve) => {
+    resolveDone = resolve;
+  });
+
+  const startedAt = Date.now();
+  let firstChunkLatencyMs: number | undefined;
+  let chunkCount = 0;
+  let startEmitted = false;
+
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeoutTimer);
+    resolveDone();
+  };
+
+  const closeSocket = () => {
+    if (!ws) return;
+    try {
+      if (
+        ws.readyState === WebSocket.OPEN ||
+        ws.readyState === WebSocket.CONNECTING
+      ) {
+        ws.close();
+      }
+    } catch {
+      // ignore
+    }
+    ws = null;
+  };
+
+  const timeoutTimer = setTimeout(() => {
+    if (!settled && !cancelled) {
+      closeSocket();
+      params.onError(
+        'Timed out waiting for Gnani Timbre v3.0 WebSocket TTS stream.',
+        'GNANI_UPSTREAM_ERROR'
+      );
+      finish();
+    }
+  }, 10000);
+
+  try {
+    ws = new WebSocket(gnani.ttsWsUrl, {
+      headers: buildGnaniHeaders(),
+      handshakeTimeout: 6000,
+    });
+  } catch {
+    params.onError(
+      'Invalid Gnani Timbre v3.0 WebSocket URL configuration.',
+      'GNANI_UPSTREAM_ERROR'
+    );
+    finish();
+    return { cancel: () => {}, done };
+  }
+
+  ws.on('open', () => {
+    if (cancelled || !ws || ws.readyState !== WebSocket.OPEN) {
+      closeSocket();
+      finish();
+      return;
+    }
+    ws.send(
+      JSON.stringify({
+        text: cleanText,
+        voice: gnani.ttsVoice,
+        model: 'timbre-v3.0',
+        language: getSpeechLang(params.language),
+        speed: 1,
+        audio_config: {
+          encoding: 'linear_pcm',
+          container: 'raw',
+          num_channels: 1,
+          sample_rate: sampleRate,
+          sample_width: 2,
+        },
+      })
+    );
+  });
+
+  ws.on('unexpected-response', (_req, res) => {
+    const status = res.statusCode ?? 0;
+    res.resume();
+    closeSocket();
+    if (!cancelled && !settled) {
+      if (status === 401 || status === 403) {
+        params.onError(
+          `Gnani Timbre v3.0 WebSocket authentication failed (HTTP ${status}).`,
+          'GNANI_AUTH_FAILED'
+        );
+      } else {
+        params.onError(
+          `Gnani Timbre v3.0 WebSocket handshake failed (HTTP ${status}).`,
+          'GNANI_UPSTREAM_ERROR'
+        );
+      }
+    }
+    finish();
+  });
+
+  ws.on('message', (raw, isBinary) => {
+    if (cancelled || settled) return;
+
+    if (isBinary) {
+      const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as ArrayBuffer);
+      if (buf.byteLength === 0) return;
+      if (!startEmitted) {
+        startEmitted = true;
+        params.onStart?.({ sampleRate });
+      }
+      chunkCount += 1;
+      if (firstChunkLatencyMs === undefined) {
+        firstChunkLatencyMs = Date.now() - startedAt;
+      }
+      const pcmBuf =
+        chunkCount === 1 &&
+        buf.byteLength > 44 &&
+        buf.toString('ascii', 0, 4) === 'RIFF'
+          ? buf.subarray(44)
+          : buf;
+      params.onChunk({
+        chunkIndex: chunkCount,
+        audioBase64: pcmBuf.toString('base64'),
+        sampleRate,
+      });
+      return;
+    }
+
+    try {
+      const msg = JSON.parse(raw.toString()) as {
+        type?: string;
+        error?: string;
+        is_final?: boolean;
+        audio?: string;
+        data?: {
+          chunk_index?: number;
+          audio?: string;
+          is_final?: boolean;
+        };
+      };
+
+      if (msg.type === 'start' && !startEmitted) {
+        startEmitted = true;
+        params.onStart?.({ sampleRate });
+        return;
+      }
+
+      if (msg.error || msg.type === 'error') {
+        const errText = msg.error || 'Gnani Timbre v3.0 streaming error.';
+        const lower = errText.toLowerCase();
+        const isAuth =
+          lower.includes('auth') ||
+          lower.includes('key') ||
+          lower.includes('unauthor') ||
+          lower.includes('forbidden');
+        closeSocket();
+        params.onError(
+          isAuth
+            ? 'Gnani Timbre v3.0 authentication failed. Check GNANI_API_KEY on the server.'
+            : errText,
+          isAuth ? 'GNANI_AUTH_FAILED' : 'GNANI_UPSTREAM_ERROR'
+        );
+        finish();
+        return;
+      }
+
+      const audioB64 = msg.data?.audio ?? msg.audio ?? '';
+      if (audioB64) {
+        if (!startEmitted) {
+          startEmitted = true;
+          params.onStart?.({ sampleRate });
+        }
+        chunkCount += 1;
+        if (firstChunkLatencyMs === undefined) {
+          firstChunkLatencyMs = Date.now() - startedAt;
+        }
+        let cleanedB64 = audioB64;
+        if (chunkCount === 1) {
+          const decoded = Buffer.from(audioB64, 'base64');
+          if (
+            decoded.byteLength > 44 &&
+            decoded.toString('ascii', 0, 4) === 'RIFF'
+          ) {
+            cleanedB64 = decoded.subarray(44).toString('base64');
+          }
+        }
+        params.onChunk({
+          chunkIndex: msg.data?.chunk_index ?? chunkCount,
+          audioBase64: cleanedB64,
+          sampleRate,
+        });
+      }
+
+      const isFinal = Boolean(
+        msg.type === 'complete' ||
+          msg.type === 'done' ||
+          msg.type === 'end' ||
+          msg.is_final ||
+          msg.data?.is_final
+      );
+      if (isFinal) {
+        closeSocket();
+        params.onComplete?.({
+          chunkCount,
+          firstChunkLatencyMs,
+          totalLatencyMs: Date.now() - startedAt,
+        });
+        finish();
+      }
+    } catch {
+      // Ignore non-JSON control frames
+    }
+  });
+
+  ws.on('error', (err) => {
+    closeSocket();
+    if (!cancelled && !settled) {
+      const msg = err.message || 'Gnani Timbre v3.0 WebSocket error.';
+      const isAuth = msg.includes('401') || msg.includes('403');
+      params.onError(
+        isAuth
+          ? 'Gnani Timbre v3.0 authentication failed. Check GNANI_API_KEY on the server.'
+          : msg,
+        isAuth ? 'GNANI_AUTH_FAILED' : 'GNANI_UPSTREAM_ERROR'
+      );
+    }
+    finish();
+  });
+
+  ws.on('close', () => {
+    if (!cancelled && !settled) {
+      if (chunkCount > 0) {
+        params.onComplete?.({
+          chunkCount,
+          firstChunkLatencyMs,
+          totalLatencyMs: Date.now() - startedAt,
+        });
+      } else {
+        params.onError(
+          'Gnani Timbre v3.0 WebSocket closed before delivering audio.',
+          'GNANI_UPSTREAM_ERROR'
+        );
+      }
+      finish();
+    }
+  });
+
+  return {
+    cancel() {
+      cancelled = true;
+      closeSocket();
+      finish();
+    },
+    done,
   };
 }
 
@@ -978,6 +1333,7 @@ export async function extractVoiceIntent(params: {
   language: LanguageCode;
   hasPendingConfirmation: boolean;
   customerNames?: string[];
+  clientDate?: string;
 }): Promise<{
   outcome: VoiceParseOutcome;
   intentProvider: 'gemini-4-hydrogen' | 'local-parser';
@@ -990,11 +1346,17 @@ export async function extractVoiceIntent(params: {
     };
   }
 
+  const refNow =
+    typeof params.clientDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(params.clientDate)
+      ? new Date(`${params.clientDate}T12:00:00`)
+      : new Date();
+
   const status = getVoicePipelineStatus();
   if (!status.geminiConfigured) {
     return {
       outcome: parseVoiceUtterance(transcript, {
         hasPendingConfirmation: params.hasPendingConfirmation,
+        now: refNow,
       }),
       intentProvider: 'local-parser',
     };
@@ -1004,14 +1366,13 @@ export async function extractVoiceIntent(params: {
     const ai = new GoogleGenAI({
       apiKey: process.env.GEMINI_API_KEY,
       httpOptions: {
-        timeout: 3500,
         headers: {
           'User-Agent': 'aistudio-build',
         },
       },
     });
 
-    const today = getTodayISO();
+    const today = getTodayISO(refNow);
     const knownCustomers = (params.customerNames ?? []).slice(0, 25).join(', ');
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     const response = await Promise.race([
@@ -1025,8 +1386,9 @@ export async function extractVoiceIntent(params: {
           systemInstruction:
             'You extract structured credit-ledger (udhaar khata) intents from Indian kirana shopkeeper speech in Hindi, Hinglish, Kannada, Kannada-English, Tamil, Telugu, Marathi, Bengali, or English. ' +
             'Understand spoken numbers and digits in English, Hindi, and Kannada/Indic scripts (e.g. "three hundred forty" -> 340, "teen sau chaalis" -> 340, "paanch sau rupaye" -> 500, "ಮುನ್ನೂರು ನಲವತ್ತು" -> 340, "ಐನೂರು" -> 500, "೩೪೦" -> 340). ' +
-            'Rules: "udhaar/baki/credit/likho/liya/ಸಾಲ/ಬಾಕಿ/ಉಧಾರಿ/ಬರೆ/ತಗೊಂಡರು/saala" means direction="credit" (CREDIT). ' +
-            '"diye/mila/jama/paid/received/vasooli/payment/ಕೊಟ್ಟರು/ಜಮಾ/ಪಾವತಿ/ಬಂದಿದೆ/ಕೊಟ್ಟಿದ್ದಾರೆ/kottaru/kotru" means direction="payment" (PAYMENT). ' +
+            'Rules: "udhaar/baki/credit/likho/liya/taken/borrowed/ಸಾಲ/ಬಾಕಿ/ಉಧಾರಿ/ಬರೆ/ತಗೊಂಡರು/saala" means direction="credit" (CREDIT). ' +
+            '"diye/mila/jama/paid/paid back/returned/received/vasooli/payment/ಕೊಟ್ಟರು/ಜಮಾ/ಪಾವತಿ/ಬಂದಿದೆ/ಕೊಟ್ಟಿದ್ದಾರೆ/kottaru/kotru" means direction="payment" (PAYMENT). ' +
+            'CRITICAL for customerName: Extract ONLY the person\'s clean name — NEVER include verbs or filler words like "has", "taken", "back", "paid", "gave", "took". If the spoken name is phonetically close to one of the Known store customers (even with minor speech-to-text spelling errors such as "Mallikaajan" for "Mallikarjun"), ALWAYS return the exact matching spelling from Known store customers. ' +
             'If pending confirmation is open and user corrects an amount or direction (e.g. "nahi 430", "payment kar do", "ಅಲ್ಲ 430", "ಇಲ್ಲ ಜಮಾ ಮಾಡಿ"), set intent="correction". ' +
             'If user asks daily totals (e.g. "aaj kitna mila?", "Aaj kitna udhaar gaya?", "today total", "ಇಂದು ಎಷ್ಟು ಬಾಕಿ?", "ಇಂದಿನ ಲೆಕ್ಕ"), set intent="query_today_summary". ' +
             'If user asks how much a specific customer owes (e.g. "How much does Suresh owe?", "Suresh ka kitna baki hai?", "ರಮೇಶ್ ಅವರ ಎಷ್ಟು ಬಾಕಿ ಇದೆ?"), set intent="query_customer_balance" and customerName="Ramesh" or the spoken name. ' +
@@ -1042,7 +1404,7 @@ export async function extractVoiceIntent(params: {
               },
               customerName: {
                 type: Type.STRING,
-                description: 'Customer name if mentioned',
+                description: 'Clean customer name only (no verbs/fillers), matched to Known store customers when phonetically close',
               },
               amount: {
                 type: Type.NUMBER,
@@ -1067,8 +1429,8 @@ export async function extractVoiceIntent(params: {
       }),
       new Promise<never>((_, reject) => {
         timeoutHandle = setTimeout(
-          () => reject(new Error('Gemini intent extraction timed out after 3500ms')),
-          3500
+          () => reject(new Error('Gemini intent extraction timed out after 6500ms')),
+          6500
         );
       }),
     ]).finally(() => {
@@ -1084,12 +1446,14 @@ export async function extractVoiceIntent(params: {
     const outcome = validateVoiceIntentPayload(
       parsed,
       transcript,
-      params.hasPendingConfirmation
+      params.hasPendingConfirmation,
+      refNow
     );
 
     if (outcome.kind === 'unknown') {
       const fallback = parseVoiceUtterance(transcript, {
         hasPendingConfirmation: params.hasPendingConfirmation,
+        now: refNow,
       });
       if (fallback.kind !== 'unknown') {
         return { outcome: fallback, intentProvider: 'local-parser' };
@@ -1102,6 +1466,7 @@ export async function extractVoiceIntent(params: {
     return {
       outcome: parseVoiceUtterance(transcript, {
         hasPendingConfirmation: params.hasPendingConfirmation,
+        now: refNow,
       }),
       intentProvider: 'local-parser',
     };
